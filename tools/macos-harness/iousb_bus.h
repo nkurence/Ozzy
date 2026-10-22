@@ -52,6 +52,7 @@ struct iousb_bus {
 	atomic_uint out_done, in_done, errors;
 	uint64_t last_done[2];                 /* mach time of the last completion, [0] out, [1] in */
 	atomic_uint_fast64_t max_gap[2];       /* longest gap since the last ibus_take_stats, mach ticks */
+	atomic_uint stall_ms;                  /* test: the next completion sleeps this long first, once */
 
 	pthread_t timer_thread;
 	atomic_bool timer_on;

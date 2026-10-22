@@ -13,6 +13,10 @@
  *     -c  record only these input channels, 1-based (e.g. -c 15-16), for long runs
  *     -q  silence instead of the test tone
  *     -W  stop when a PCM direction stops completing for 3 s (a wedge), instead of running on
+ *     -X  test: every 10 s, freeze the completion thread for this many ms (a host that stops
+ *         serving the device), to find whether and when a service gap wedges it
+ *     -F  frames per PCM transfer, both ways (a multiple of 40, up to 200; default 80): with 4
+ *         transfers in flight, the gap the device survives is 4 x frames
  *
  * Every second it prints the wall-clock time, the device clock, transfers per second, errors,
  * the engine's late counts and the longest gap between two completions of each PCM pipe. A
@@ -175,6 +179,7 @@ static void print_stats(const struct ozzy_stats *st)
 int main(int argc, char **argv)
 {
 	bool list = false, quiet = false, stop_on_wedge = false;
+	unsigned int stall_ms = 0, xfer_frames = 0;
 	int index = 0, seconds = 0;
 	uint32_t want_rate = 0;
 	unsigned int ch_first = 1, ch_last = 0;   /* 0: up to the device's last input */
@@ -186,6 +191,15 @@ int main(int argc, char **argv)
 			quiet = true;
 		else if (!strcmp(argv[i], "-W"))
 			stop_on_wedge = true;
+		else if (!strcmp(argv[i], "-X") && i + 1 < argc)
+			stall_ms = (unsigned int)atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-F") && i + 1 < argc) {
+			xfer_frames = (unsigned int)atoi(argv[++i]);
+			if (!xfer_frames || xfer_frames % 40 || xfer_frames > 200) {
+				fprintf(stderr, "-F: a multiple of 40 up to 200\n");
+				return 2;
+			}
+		}
 		else if (!strcmp(argv[i], "-d") && i + 1 < argc)
 			index = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-R") && i + 1 < argc)
@@ -198,7 +212,7 @@ int main(int argc, char **argv)
 			if (sscanf(argv[++i], "%u-%u", &ch_first, &ch_last) == 1)
 				ch_last = ch_first;
 		} else {
-			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W]\n");
+			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-X ms] [-F frames]\n");
 			return 2;
 		}
 	}
@@ -253,6 +267,10 @@ int main(int argc, char **argv)
 	ozzy_engine_set_anchors(engine, true);   /* the clock statistics and the input reader below */
 	if (want_rate)
 		ozzy_engine_set_rate(engine, want_rate);
+	if (xfer_frames) {   /* settings values: out (v + 1) x 10 frames, in (v + 1) x 8 (ozzy_pcm_frames) */
+		ozzy_engine_set_setting(engine, OZZY_SETTING_PCM_OUT_FRAMES, (uint8_t)(xfer_frames / 10 - 1));
+		ozzy_engine_set_setting(engine, OZZY_SETTING_PCM_IN_FRAMES, (uint8_t)(xfer_frames / 8 - 1));
+	}
 	if (!ozzy_engine_start(engine)) {
 		fprintf(stderr, "engine start failed\n");
 		ozzy_engine_stop(engine);
@@ -356,6 +374,11 @@ int main(int argc, char **argv)
 			}
 			if (stop_on_wedge && (wedged[0] || wedged[1]))
 				quit = 1;
+			static unsigned int tick;
+			if (stall_ms && ++tick % 10 == 5) {
+				fprintf(stderr, "STALL: freezing the completion thread for %u ms\n", stall_ms);
+				atomic_store(&bus.stall_ms, stall_ms);
+			}
 		}
 	}
 

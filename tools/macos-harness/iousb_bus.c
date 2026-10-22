@@ -80,6 +80,9 @@ static void ibus_complete(void *refcon, IOReturn result, void *arg0)
 	struct ibus_transfer *t = refcon;
 	struct iousb_bus *ib = t->ib;
 	uint32_t bytes = (uint32_t)(uintptr_t)arg0;
+	unsigned int stall = atomic_exchange(&ib->stall_ms, 0);
+	if (stall)   /* test (-X): a host that stops serving the device for a while */
+		usleep(stall * 1000);
 	uint8_t pipe = t->pipe;
 	void *xfer = t->xfer;
 	int status = result == kIOReturnSuccess ? 0 : (int)result;
