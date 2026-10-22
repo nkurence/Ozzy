@@ -17,6 +17,8 @@
  *         serving the device), to find whether and when a service gap wedges it
  *     -F  frames per PCM transfer, both ways (a multiple of 40, up to 200; default 80): with 4
  *         transfers in flight, the gap the device survives is 4 x frames
+ *     -Q  PCM IN transfers in flight (2 to OZZY_NUM_PCM_IN_QUEUES, 8 in this build; default 4).
+ *         In, every one but the first is margin, not latency: the gap IN survives is Q x frames
  *     -P  the completion thread's real-time policy: "off", or period_us:compute_us
  *         (default 1000:250), for measuring how the policy shapes the gaps
  *     -A  recover a wedge: a PCM direction with no completions for 0.5 s suspends the engine,
@@ -32,7 +34,7 @@
  * the engine's late counts and the longest gap between two completions of each PCM pipe. A
  * direction with no completions for 3 s is reported once as WEDGED: the engine's late count
  * can't see that, because it is measured when a completion closes a gap and a stopped pipe
- * never closes one. This harness has no recovery (the Windows driver resets the port).
+ * never closes one. Without -A it stays wedged (the Windows driver resets the port).
  */
 
 #include "iousb_bus.h"
@@ -189,7 +191,7 @@ static void print_stats(const struct ozzy_stats *st)
 int main(int argc, char **argv)
 {
 	bool list = false, quiet = false, stop_on_wedge = false, auto_recover = false;
-	unsigned int stall_ms = 0, xfer_frames = 0, rt_period = 0, rt_compute = 0;
+	unsigned int stall_ms = 0, xfer_frames = 0, in_queue = 0, rt_period = 0, rt_compute = 0;
 	bool rt_off = false;
 	int index = 0, seconds = 0;
 	uint32_t want_rate = 0;
@@ -221,6 +223,12 @@ int main(int argc, char **argv)
 				fprintf(stderr, "-F: a multiple of 40 up to 200\n");
 				return 2;
 			}
+		} else if (!strcmp(argv[i], "-Q") && i + 1 < argc) {
+			in_queue = (unsigned int)atoi(argv[++i]);
+			if (in_queue < OZZY_PCM_QUEUE_MIN + 1 || in_queue > OZZY_NUM_PCM_IN_QUEUES) {
+				fprintf(stderr, "-Q: %u to %u\n", OZZY_PCM_QUEUE_MIN + 1, OZZY_NUM_PCM_IN_QUEUES);
+				return 2;
+			}
 		}
 		else if (!strcmp(argv[i], "-d") && i + 1 < argc)
 			index = atoi(argv[++i]);
@@ -234,7 +242,7 @@ int main(int argc, char **argv)
 			if (sscanf(argv[++i], "%u-%u", &ch_first, &ch_last) == 1)
 				ch_last = ch_first;
 		} else {
-			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-A] [-X ms] [-F frames] [-P off|period:compute]\n");
+			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-A] [-X ms] [-F frames] [-Q in_flight] [-P off|period:compute]\n");
 			return 2;
 		}
 	}
@@ -299,6 +307,8 @@ int main(int argc, char **argv)
 		ozzy_engine_set_setting(engine, OZZY_SETTING_PCM_OUT_FRAMES, (uint8_t)(xfer_frames / 10 - 1));
 		ozzy_engine_set_setting(engine, OZZY_SETTING_PCM_IN_FRAMES, (uint8_t)(xfer_frames / 8 - 1));
 	}
+	if (in_queue)
+		ozzy_engine_set_setting(engine, OZZY_SETTING_PCM_IN_QUEUE, (uint8_t)(in_queue - 1));
 	if (!ozzy_engine_start(engine)) {
 		fprintf(stderr, "engine start failed\n");
 		ozzy_engine_stop(engine);
@@ -308,6 +318,16 @@ int main(int argc, char **argv)
 
 	uint32_t rate = shm->audio.sample_rate, in = shm->audio.input_channels, out = shm->audio.output_channels;
 	fprintf(stderr, "running at %u Hz, %u in / %u out\n", rate, in, out);
+	{
+		/* As the engine runs them (it may have taken fewer than asked: its places) */
+		uint32_t q_out = engine->report.in_flight[OZZY_PIPE_PCM_OUT], q_in = engine->report.in_flight[OZZY_PIPE_PCM_IN];
+		uint32_t f_out = ozzy_pcm_frames(false, engine->settings.value[OZZY_SETTING_PCM_OUT_FRAMES]);
+		uint32_t f_in = ozzy_pcm_frames(true, engine->settings.value[OZZY_SETTING_PCM_IN_FRAMES]);
+		fprintf(stderr, "in flight: out %u x %u frames (%.1f ms), in %u x %u frames (%.1f ms)\n", q_out, f_out,
+			rate ? 1000.0 * q_out * f_out / rate : 0.0, q_in, f_in, rate ? 1000.0 * q_in * f_in / rate : 0.0);
+		if (in_queue && q_in != in_queue)
+			fprintf(stderr, "note: asked for %u in flight\n", in_queue);
+	}
 	if (want_rate && want_rate != rate)
 		fprintf(stderr, "note: asked for %u Hz\n", want_rate);
 	if (out && !quiet)

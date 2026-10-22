@@ -113,13 +113,34 @@ enum ozzy_spdif_out_mode {
  */
 #define OZZY_NUM_PCM_QUEUES 4
 
+/*
+ * In, more can be offered than out, since it is margin and not latency. A build may raise it (the
+ * macOS harness: 8, measuring whether margin is what a userspace host is short of at 96 kHz); a
+ * platform with buffers of its own runs no more in flight than it has places (ploytec_start).
+ */
+#ifndef OZZY_NUM_PCM_IN_QUEUES
+#define OZZY_NUM_PCM_IN_QUEUES OZZY_NUM_PCM_QUEUES
+#endif
+#define OZZY_MAX_PCM_QUEUES 8          /* the names below */
+
+typedef char ozzy_pcm_in_queues_fit[(OZZY_NUM_PCM_IN_QUEUES >= OZZY_NUM_PCM_QUEUES &&
+				     OZZY_NUM_PCM_IN_QUEUES <= OZZY_MAX_PCM_QUEUES) ? 1 : -1];
+
 #define OZZY_PCM_QUEUE_MIN 1           /* the lowest value offered: two in flight */
+
+/* The transfers in flight for value @value of the out (@in false) or in queue setting */
+static inline uint32_t ozzy_pcm_queue_dir(bool in, unsigned int value)
+{
+	unsigned int n = in ? OZZY_NUM_PCM_IN_QUEUES : OZZY_NUM_PCM_QUEUES;
+
+	if (value < OZZY_PCM_QUEUE_MIN)
+		value = OZZY_PCM_QUEUE_MIN;
+	return value < n ? value + 1 : n;
+}
 
 static inline uint32_t ozzy_pcm_queue(unsigned int value)
 {
-	if (value < OZZY_PCM_QUEUE_MIN)
-		value = OZZY_PCM_QUEUE_MIN;
-	return value < OZZY_NUM_PCM_QUEUES ? value + 1 : OZZY_NUM_PCM_QUEUES;
+	return ozzy_pcm_queue_dir(false, value);
 }
 
 /*
@@ -227,8 +248,9 @@ static const char *const ozzy_pcm_in_frames_names[OZZY_NUM_PCM_IN_FRAMES] = {
 	"152 frames", "160 frames", "168 frames", "176 frames", "184 frames", "192 frames",
 	"200 frames" };
 
-static const char *const ozzy_pcm_queue_names[OZZY_NUM_PCM_QUEUES] = {
-	"1 transfer", "2 transfers", "3 transfers", "4 transfers" };
+static const char *const ozzy_pcm_queue_names[OZZY_MAX_PCM_QUEUES] = {
+	"1 transfer", "2 transfers", "3 transfers", "4 transfers",
+	"5 transfers", "6 transfers", "7 transfers", "8 transfers" };
 static const char *const ozzy_io_buffer_names[OZZY_NUM_IO_BUFFERS] = {
 	"300 frames", "600 frames", "1200 frames", "2400 frames" };
 
@@ -257,7 +279,7 @@ static const struct ozzy_setting_desc ozzy_setting_descs[OZZY_NUM_SETTINGS] = {
 	  OZZY_QUIRK_PCM_IN_FRAMES, OZZY_SETTING_DEVICE, 0 },
 	{ "PCM Playback Queue", ozzy_pcm_queue_names, OZZY_NUM_PCM_QUEUES, OZZY_NUM_PCM_QUEUES - 1,
 	  OZZY_QUIRK_PCM_OUT_QUEUE, OZZY_SETTING_DEVICE, 0 },
-	{ "PCM Capture Queue", ozzy_pcm_queue_names, OZZY_NUM_PCM_QUEUES, OZZY_NUM_PCM_QUEUES - 1,
+	{ "PCM Capture Queue", ozzy_pcm_queue_names, OZZY_NUM_PCM_IN_QUEUES, OZZY_NUM_PCM_QUEUES - 1,
 	  OZZY_QUIRK_PCM_IN_QUEUE, OZZY_SETTING_DEVICE, 0 },
 	{ "Largest IO Buffer", ozzy_io_buffer_names, OZZY_NUM_IO_BUFFERS, 2,
 	  OZZY_QUIRK_CLOCK_ANCHORS, OZZY_SETTING_DEVICE, 0 },

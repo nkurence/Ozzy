@@ -203,9 +203,68 @@ static void isoc(void)
 	free(e);
 }
 
+/*
+ * The deepest in queue a build offers, on the platform's own memory and on the shared memory's
+ * rings: no more in flight than places, each in a buffer of its own. Only a build whose in queue
+ * is deeper than OZZY_PCM_OWN_SLOTS (the macOS harness: 8) can take more than there are places;
+ * in the others both arms run as many as asked, and the clamp in ploytec_start isn't reached.
+ */
+static void in_queue_places(void)
+{
+	const struct ozzy_device *model = ozzy_device_lookup(0x0A4A, 0xFFDB);
+	static struct ozzy_shared_memory shm;
+	unsigned int own;
+
+	for (own = 0; own < 2; own++) {
+		struct platform_memory pm = { { 0 } };
+		struct ozzy_allocator a = { pm_alloc, pm_free, &pm };
+		uint32_t want = own && OZZY_NUM_PCM_IN_QUEUES > OZZY_PCM_OWN_SLOTS ? OZZY_PCM_OWN_SLOTS
+										   : OZZY_NUM_PCM_IN_QUEUES;
+		const uint8_t *bufs[OZZY_MAX_PCM_QUEUES + 1];
+		unsigned int n = 0, same = 0, k;
+		struct fake_bus fb;
+		struct fake_xfer x;
+		struct ozzy_engine *e;
+
+		memset(&shm, 0, sizeof(shm));
+		fake_bus_init(&fb, &shm, true, NULL);
+		e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
+		ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x05, 3, 964, 1);
+		ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 3, 1024, 1);
+		ozzy_engine_set_endpoint(e, OZZY_PIPE_MIDI_IN, 0x83, 3, 64, 1);
+		ozzy_engine_attach(e, &fb.bus, &shm);
+		if (own)
+			CHECK(ozzy_engine_alloc_memory(e, &a), "in queue: alloc");
+		CHECK(ozzy_engine_change_setting(e, OZZY_SETTING_PCM_IN_QUEUE, OZZY_NUM_PCM_IN_QUEUES - 1) !=
+		      OZZY_SETTING_INVALID, "in queue: %u in flight offered", OZZY_NUM_PCM_IN_QUEUES);
+		CHECK(ozzy_engine_start(e), "in queue: start");
+
+		/* What start() put in flight, none completed yet */
+		while (fake_bus_pop(&fb, &x)) {
+			if (x.pipe != 0x86)
+				continue;
+			for (k = 0; k < n && k < OZZY_MAX_PCM_QUEUES + 1; k++)
+				same += bufs[k] == x.buf;
+			if (n < OZZY_MAX_PCM_QUEUES + 1)
+				bufs[n] = x.buf;
+			n++;
+		}
+		CHECK(n == want && !same && e->report.in_flight[OZZY_PIPE_PCM_IN] == want &&
+		      e->settings.value[OZZY_SETTING_PCM_IN_QUEUE] == want - 1,
+		      "in queue (%s): %u in flight (want %u, reported %u, setting %u), %u sharing a buffer",
+		      own ? "own memory" : "rings", n, want, e->report.in_flight[OZZY_PIPE_PCM_IN],
+		      e->settings.value[OZZY_SETTING_PCM_IN_QUEUE] + 1u, same);
+		ozzy_engine_stop(e);
+		if (own)
+			platform_memory_done(&pm, e, "in queue");
+		free(e);
+	}
+}
+
 int main(void)
 {
 	xone();
 	isoc();
+	in_queue_places();
 	return CHECK_DONE("platform memory");
 }
