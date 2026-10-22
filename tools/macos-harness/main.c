@@ -19,6 +19,10 @@
  *         transfers in flight, the gap the device survives is 4 x frames
  *     -P  the completion thread's real-time policy: "off", or period_us:compute_us
  *         (default 1000:250), for measuring how the policy shapes the gaps
+ *     -A  recover a wedge: a PCM direction with no completions for 0.5 s suspends the engine,
+ *         selects the interfaces' alternate setting again (which resets the endpoints on the
+ *         device side) and starts it again with its handshake; each one is logged as RECOVERED
+ *         or RECOVERY FAILED with how long it took, and counted in the engine's stats
  *
  * With -r the reader that copies the input ring to the WAV runs under a real-time policy too,
  * so a loaded machine can't make it fall half a ring behind and drop frames (which shows in the
@@ -184,7 +188,7 @@ static void print_stats(const struct ozzy_stats *st)
 
 int main(int argc, char **argv)
 {
-	bool list = false, quiet = false, stop_on_wedge = false;
+	bool list = false, quiet = false, stop_on_wedge = false, auto_recover = false;
 	unsigned int stall_ms = 0, xfer_frames = 0, rt_period = 0, rt_compute = 0;
 	bool rt_off = false;
 	int index = 0, seconds = 0;
@@ -198,6 +202,8 @@ int main(int argc, char **argv)
 			quiet = true;
 		else if (!strcmp(argv[i], "-W"))
 			stop_on_wedge = true;
+		else if (!strcmp(argv[i], "-A"))
+			auto_recover = true;
 		else if (!strcmp(argv[i], "-X") && i + 1 < argc)
 			stall_ms = (unsigned int)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-P") && i + 1 < argc) {
@@ -228,7 +234,7 @@ int main(int argc, char **argv)
 			if (sscanf(argv[++i], "%u-%u", &ch_first, &ch_last) == 1)
 				ch_last = ch_first;
 		} else {
-			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-X ms] [-F frames] [-P off|period:compute]\n");
+			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-A] [-X ms] [-F frames] [-P off|period:compute]\n");
 			return 2;
 		}
 	}
@@ -331,9 +337,61 @@ int main(int argc, char **argv)
 	uint32_t last_late[2] = { 0, 0 };
 	unsigned int idle_secs[2] = { 0, 0 };   /* consecutive seconds without completions, out / in */
 	bool wedged[2] = { false, false };
+	/* the recovery watchdog: when each direction last made progress */
+	uint64_t seen_done[2] = { atomic_load(&bus.total_done[0]), atomic_load(&bus.total_done[1]) };
+	uint64_t seen_at[2] = { start, start };
+	unsigned int recovered = 0, recovery_failed = 0;
+	uint64_t recovery_ms_max = 0, recovery_ms_sum = 0;
+	bool resync = false;   /* the reader takes up from the current position after a restart */
 
 	while (!quit && (!seconds || now_ms() - start < (uint64_t)seconds * 1000)) {
 		usleep(20000);
+
+		/* Recovery watchdog: a PCM direction that made no progress for 0.5 s */
+		uint64_t t_now = now_ms();
+		for (int d = 0; d < 2; d++) {
+			uint64_t n = atomic_load(&bus.total_done[d]);
+			if (n != seen_done[d]) {
+				seen_done[d] = n;
+				seen_at[d] = t_now;
+			}
+		}
+		if (auto_recover && (t_now - seen_at[0] >= 500 || t_now - seen_at[1] >= 500)) {
+			struct timespec wall;
+			clock_gettime(CLOCK_REALTIME, &wall);
+			fprintf(stderr, "%ld.%03ld RECOVER: PCM %s stopped (%llu ms without a completion)\n",
+				(long)wall.tv_sec, wall.tv_nsec / 1000000, t_now - seen_at[1] >= 500 ? "in" : "out",
+				(unsigned long long)(t_now - (seen_at[1] < seen_at[0] ? seen_at[1] : seen_at[0])));
+			uint64_t t0 = now_ms();
+			ozzy_engine_suspend(engine);
+			bool ok = ibus_reselect(&bus) && ozzy_engine_start(engine);
+			/* streaming again only once both directions complete */
+			uint64_t base[2] = { atomic_load(&bus.total_done[0]), atomic_load(&bus.total_done[1]) };
+			while (ok && now_ms() - t0 < 3000 &&
+			       (atomic_load(&bus.total_done[0]) == base[0] || atomic_load(&bus.total_done[1]) == base[1]))
+				usleep(1000);
+			ok = ok && atomic_load(&bus.total_done[0]) != base[0] && atomic_load(&bus.total_done[1]) != base[1];
+			uint64_t took = now_ms() - t0;
+			ozzy_engine_stats_recovery(engine, ok);
+			if (ok) {
+				recovered++;
+				recovery_ms_sum += took;
+				if (took > recovery_ms_max)
+					recovery_ms_max = took;
+				if (out && !quiet)
+					fill_tone(shm, out, rate);   /* the restart laid the output ring out again */
+			} else {
+				recovery_failed++;
+			}
+			fprintf(stderr, "%s after %llu ms\n", ok ? "RECOVERED" : "RECOVERY FAILED", (unsigned long long)took);
+			seen_at[0] = seen_at[1] = now_ms();
+			seen_done[0] = atomic_load(&bus.total_done[0]);
+			seen_done[1] = atomic_load(&bus.total_done[1]);
+			resync = true;
+			have_first = false;
+			if (!ok)
+				break;
+		}
 
 		/* MIDI in */
 		uint8_t midi[256];
@@ -360,6 +418,10 @@ int main(int argc, char **argv)
 			const uint32_t in_frames = shm->audio.input_ring_frames ? shm->audio.input_ring_frames : 1;
 			const uint32_t behind = shm->audio.input_safety_offset_frames;
 			uint64_t end = sample_time > behind ? sample_time - behind : 0;
+			if (resync) {   /* after a restart: take up from here (the gap shows in the WAV) */
+				next_frame = end;
+				resync = false;
+			}
 			if (end > next_frame + in_frames / 2) {
 				lost += end - in_frames / 2 - next_frame;
 				next_frame = end - in_frames / 2;
@@ -415,6 +477,10 @@ int main(int argc, char **argv)
 	print_stats(&final_stats);
 	if (lost)
 		fprintf(stderr, "input frames lost by the WAV reader: %llu\n", (unsigned long long)lost);
+	if (auto_recover)
+		fprintf(stderr, "recoveries: %u ok, %u failed; time to stream again: max %llu ms, mean %llu ms\n",
+			recovered, recovery_failed, (unsigned long long)recovery_ms_max,
+			(unsigned long long)(recovered ? recovery_ms_sum / recovered : 0));
 	free(engine);
 	munmap(shm, sizeof(*shm));
 	for (int i = 0; i < device_count; i++)

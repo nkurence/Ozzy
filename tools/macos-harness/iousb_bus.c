@@ -94,6 +94,7 @@ static void ibus_complete(void *refcon, IOReturn result, void *arg0)
 		atomic_fetch_add(dir ? &ib->in_done : &ib->out_done, 1);
 		/* gaps between completions of the PCM pipes only (MIDI in completes on its own schedule) */
 		if (pipe == 0x05 || pipe == 0x86) {
+			atomic_fetch_add(&ib->total_done[dir], 1);
 			if (ib->last_done[dir]) {
 				uint64_t gap = now - ib->last_done[dir];
 				if (gap > atomic_load(&ib->max_gap[dir]))
@@ -529,6 +530,47 @@ bool ibus_configure(struct iousb_bus *ib)
 			 ozzy_usb_endpoint_bytes(bound[role]));
 	}
 	return true;
+}
+
+bool ibus_reselect(struct iousb_bus *ib)
+{
+	uint8_t alt = ib->engine->profile.alt_setting;
+	bool ok = true;
+	for (int k = 0; k < ib->intf_count; k++) {
+		ibus_interface intf = ib->intf[k];
+		if (!ib->intf_source[k])   /* not one we claimed */
+			continue;
+		IOReturn r0 = (*intf)->SetAlternateInterface(intf, 0);
+		IOReturn r1 = (*intf)->SetAlternateInterface(intf, alt);
+		if (r0 != kIOReturnSuccess || r1 != kIOReturnSuccess) {
+			ibus_log("[IOUSBBus] interface %u: reselect failed: 0x%08x / 0x%08x", ib->intf_number[k], r0, r1);
+			ok = false;
+		}
+	}
+	usleep(50000);
+	/* the pipes again, by address (pipeRefs index the endpoints of the current setting) */
+	for (int s = 0; s < IBUS_PIPE_SLOTS; s++) {
+		ibus_interface intf = ib->pipe_intf[s];
+		if (!intf)
+			continue;
+		UInt8 count = 0, found = 0;
+		(*intf)->GetNumEndpoints(intf, &count);
+		for (UInt8 ref = 1; ref <= count; ref++) {
+			UInt8 dir = 0, number = 0, type = 0, interval = 0;
+			UInt16 max_packet = 0;
+			if ((*intf)->GetPipeProperties(intf, ref, &dir, &number, &type, &max_packet, &interval) == kIOReturnSuccess &&
+			    (uint8_t)((number & 0x0F) | (dir == kUSBIn ? 0x80 : 0)) == ib->pipe_addr[s])
+				found = ref;
+		}
+		if (!found) {
+			ibus_log("[IOUSBBus] pipe 0x%02x missing after reselect", ib->pipe_addr[s]);
+			ok = false;
+		} else {
+			ib->pipe_ref[s] = found;
+		}
+	}
+	ib->last_done[0] = ib->last_done[1] = 0;
+	return ok;
 }
 
 bool ibus_get_string(struct iousb_bus *ib, uint8_t index, char *dst, size_t size)

@@ -51,6 +51,7 @@ struct iousb_bus {
 	atomic_int pending;
 	atomic_uint out_done, in_done, errors;
 	uint64_t last_done[2];                 /* mach time of the last completion, [0] out, [1] in */
+	atomic_uint_fast64_t total_done[2];    /* PCM completions since open, never reset (the watchdog) */
 	atomic_uint_fast64_t max_gap[2];       /* longest gap since the last ibus_take_stats, mach ticks */
 	atomic_uint stall_ms;                  /* test: the next completion sleeps this long first, once */
 	uint32_t rt_period_us, rt_compute_us;  /* the completion thread's time-constraint policy, 0: none
@@ -82,6 +83,11 @@ void ibus_close(struct iousb_bus *ib);
 /* What OzzyKext::ConfigureHardware does: configuration 1, claim the profile's interfaces,
  * select the alternate setting, hand every endpoint to ozzy_engine_bind_endpoints */
 bool ibus_configure(struct iousb_bus *ib);
+
+/* Recovery from a wedged pipe, with the engine suspended (nothing in flight): select alternate
+ * setting 0 and then the profile's again on every claimed interface, which resets their
+ * endpoints on the device side, and look the pipes up again. False if that failed. */
+bool ibus_reselect(struct iousb_bus *ib);
 
 /* String descriptor @index (US English) as ASCII into @dst; false if there is none */
 bool ibus_get_string(struct iousb_bus *ib, uint8_t index, char *dst, size_t size);
