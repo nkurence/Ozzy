@@ -39,7 +39,7 @@ static uint64_t ns_to_abs(uint64_t ns)
 
 /* Run the calling thread under the time-constraint (real-time) policy CoreAudio's IO threads
  * use: @period_us apart, needing up to @compute_us of it */
-static void make_realtime(uint32_t period_us, uint32_t compute_us)
+void ibus_make_realtime(uint32_t period_us, uint32_t compute_us)
 {
 	thread_time_constraint_policy_data_t pol = {
 		.period = (uint32_t)ns_to_abs(period_us * 1000ull),
@@ -177,7 +177,7 @@ static int ibus_clear_halt(void *ctx, uint8_t address)
 static void *ibus_timer_thread(void *arg)
 {
 	struct iousb_bus *ib = arg;
-	make_realtime(ib->timer_interval_us, ib->timer_interval_us / 4 + 1);
+	ibus_make_realtime(ib->timer_interval_us, ib->timer_interval_us / 4 + 1);
 	uint64_t interval = ns_to_abs(ib->timer_interval_us * 1000ull);
 	uint64_t deadline = mach_absolute_time() + interval;
 	while (atomic_load(&ib->timer_on)) {
@@ -259,7 +259,8 @@ static void ibus_idle(CFRunLoopTimerRef timer, void *info)
 static void *ibus_completion_thread(void *arg)
 {
 	struct iousb_bus *ib = arg;
-	make_realtime(1000, 250);
+	if (!ib->rt_off)
+		ibus_make_realtime(ib->rt_period_us ? ib->rt_period_us : 1000, ib->rt_compute_us ? ib->rt_compute_us : 250);
 	CFRunLoopTimerRef keepalive = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 1e9, 1e9, 0, 0,
 							   ibus_idle, NULL);
 	CFRunLoopAddTimer(CFRunLoopGetCurrent(), keepalive, kCFRunLoopDefaultMode);

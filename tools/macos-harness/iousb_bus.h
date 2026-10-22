@@ -53,6 +53,10 @@ struct iousb_bus {
 	uint64_t last_done[2];                 /* mach time of the last completion, [0] out, [1] in */
 	atomic_uint_fast64_t max_gap[2];       /* longest gap since the last ibus_take_stats, mach ticks */
 	atomic_uint stall_ms;                  /* test: the next completion sleeps this long first, once */
+	uint32_t rt_period_us, rt_compute_us;  /* the completion thread's time-constraint policy, 0: none
+						  (set before ibus_open; both 0 from a zeroed struct means
+						  the default, 1000 / 250) */
+	bool rt_off;                           /* test: run the completion thread without it */
 
 	pthread_t timer_thread;
 	atomic_bool timer_on;
@@ -88,5 +92,9 @@ enum ozzy_usb_speed ibus_speed(const struct iousb_bus *ib);
 struct ibus_stats ibus_take_stats(struct iousb_bus *ib);
 
 void ibus_log(const char *fmt, ...) OZZY_PRINTF_FORMAT(1, 2);
+
+/* Run the calling thread under the time-constraint policy: @period_us apart, needing up to
+ * @compute_us of it */
+void ibus_make_realtime(uint32_t period_us, uint32_t compute_us);
 
 #endif

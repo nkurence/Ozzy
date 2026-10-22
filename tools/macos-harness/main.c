@@ -17,6 +17,12 @@
  *         serving the device), to find whether and when a service gap wedges it
  *     -F  frames per PCM transfer, both ways (a multiple of 40, up to 200; default 80): with 4
  *         transfers in flight, the gap the device survives is 4 x frames
+ *     -P  the completion thread's real-time policy: "off", or period_us:compute_us
+ *         (default 1000:250), for measuring how the policy shapes the gaps
+ *
+ * With -r the reader that copies the input ring to the WAV runs under a real-time policy too,
+ * so a loaded machine can't make it fall half a ring behind and drop frames (which shows in the
+ * WAV as a discontinuity that is not the device's).
  *
  * Every second it prints the wall-clock time, the device clock, transfers per second, errors,
  * the engine's late counts and the longest gap between two completions of each PCM pipe. A
@@ -179,7 +185,8 @@ static void print_stats(const struct ozzy_stats *st)
 int main(int argc, char **argv)
 {
 	bool list = false, quiet = false, stop_on_wedge = false;
-	unsigned int stall_ms = 0, xfer_frames = 0;
+	unsigned int stall_ms = 0, xfer_frames = 0, rt_period = 0, rt_compute = 0;
+	bool rt_off = false;
 	int index = 0, seconds = 0;
 	uint32_t want_rate = 0;
 	unsigned int ch_first = 1, ch_last = 0;   /* 0: up to the device's last input */
@@ -193,7 +200,16 @@ int main(int argc, char **argv)
 			stop_on_wedge = true;
 		else if (!strcmp(argv[i], "-X") && i + 1 < argc)
 			stall_ms = (unsigned int)atoi(argv[++i]);
-		else if (!strcmp(argv[i], "-F") && i + 1 < argc) {
+		else if (!strcmp(argv[i], "-P") && i + 1 < argc) {
+			const char *p = argv[++i];
+			if (!strcmp(p, "off"))
+				rt_off = true;
+			else if (sscanf(p, "%u:%u", &rt_period, &rt_compute) != 2 || !rt_period || !rt_compute ||
+				 rt_compute > rt_period) {
+				fprintf(stderr, "-P: off, or period_us:compute_us with compute <= period\n");
+				return 2;
+			}
+		} else if (!strcmp(argv[i], "-F") && i + 1 < argc) {
 			xfer_frames = (unsigned int)atoi(argv[++i]);
 			if (!xfer_frames || xfer_frames % 40 || xfer_frames > 200) {
 				fprintf(stderr, "-F: a multiple of 40 up to 200\n");
@@ -212,7 +228,7 @@ int main(int argc, char **argv)
 			if (sscanf(argv[++i], "%u-%u", &ch_first, &ch_last) == 1)
 				ch_last = ch_first;
 		} else {
-			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-X ms] [-F frames]\n");
+			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-X ms] [-F frames] [-P off|period:compute]\n");
 			return 2;
 		}
 	}
@@ -243,6 +259,12 @@ int main(int argc, char **argv)
 		return 1;
 
 	static struct iousb_bus bus;
+	bus.rt_off = rt_off;
+	bus.rt_period_us = rt_period;
+	bus.rt_compute_us = rt_compute;
+	fprintf(stderr, "completion thread: %s\n", rt_off ? "no real-time policy" : "real-time policy");
+	if (rt_period)
+		fprintf(stderr, "  period %u us, computation %u us\n", rt_period, rt_compute);
 	if (!ibus_open(&bus, found->service, engine)) {
 		ibus_close(&bus);
 		return 1;
@@ -300,6 +322,8 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+	if (wav.f)   /* the reader: 20 ms apart, a fraction of that to copy what came in */
+		ibus_make_realtime(20000, 2000);
 	const uint64_t hz = bus.bus.ops->time_hz(&bus);
 	uint64_t first_sample = 0, first_host = 0, next_frame = 0, lost = 0;
 	bool have_first = false;
