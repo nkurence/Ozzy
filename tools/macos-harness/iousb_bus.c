@@ -85,9 +85,20 @@ static void ibus_complete(void *refcon, IOReturn result, void *arg0)
 	int status = result == kIOReturnSuccess ? 0 : (int)result;
 	free(t);
 
-	if (status == 0)
-		atomic_fetch_add((pipe & 0x80) ? &ib->in_done : &ib->out_done, 1);
-	else if (result != kIOReturnAborted && atomic_fetch_add(&ib->errors, 1) < 10)
+	if (status == 0) {
+		int dir = (pipe & 0x80) ? 1 : 0;
+		uint64_t now = mach_absolute_time();
+		atomic_fetch_add(dir ? &ib->in_done : &ib->out_done, 1);
+		/* gaps between completions of the PCM pipes only (MIDI in completes on its own schedule) */
+		if (pipe == 0x05 || pipe == 0x86) {
+			if (ib->last_done[dir]) {
+				uint64_t gap = now - ib->last_done[dir];
+				if (gap > atomic_load(&ib->max_gap[dir]))
+					atomic_store(&ib->max_gap[dir], gap);
+			}
+			ib->last_done[dir] = now;
+		}
+	} else if (result != kIOReturnAborted && atomic_fetch_add(&ib->errors, 1) < 10)
 		ibus_log("[IOUSBBus] pipe 0x%02x error: 0x%08x (%u bytes)", pipe, result, bytes);
 
 	if (ib->engine)
@@ -557,10 +568,14 @@ enum ozzy_usb_speed ibus_speed(const struct iousb_bus *ib)
 
 struct ibus_stats ibus_take_stats(struct iousb_bus *ib)
 {
+	uint64_t g_out = atomic_exchange(&ib->max_gap[0], 0), g_in = atomic_exchange(&ib->max_gap[1], 0);
+	uint64_t per_us = ns_to_abs(1000);
 	struct ibus_stats s = {
 		atomic_exchange(&ib->out_done, 0),
 		atomic_exchange(&ib->in_done, 0),
 		atomic_exchange(&ib->errors, 0),
+		(uint32_t)(g_out / (per_us ? per_us : 1)),
+		(uint32_t)(g_in / (per_us ? per_us : 1)),
 	};
 	return s;
 }

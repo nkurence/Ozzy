@@ -12,6 +12,13 @@
  *     -r  record the input to a 24-bit WAV file
  *     -c  record only these input channels, 1-based (e.g. -c 15-16), for long runs
  *     -q  silence instead of the test tone
+ *     -W  stop when a PCM direction stops completing for 3 s (a wedge), instead of running on
+ *
+ * Every second it prints the wall-clock time, the device clock, transfers per second, errors,
+ * the engine's late counts and the longest gap between two completions of each PCM pipe. A
+ * direction with no completions for 3 s is reported once as WEDGED: the engine's late count
+ * can't see that, because it is measured when a completion closes a gap and a stopped pipe
+ * never closes one. This harness has no recovery (the Windows driver resets the port).
  */
 
 #include "iousb_bus.h"
@@ -167,7 +174,7 @@ static void print_stats(const struct ozzy_stats *st)
 
 int main(int argc, char **argv)
 {
-	bool list = false, quiet = false;
+	bool list = false, quiet = false, stop_on_wedge = false;
 	int index = 0, seconds = 0;
 	uint32_t want_rate = 0;
 	unsigned int ch_first = 1, ch_last = 0;   /* 0: up to the device's last input */
@@ -177,6 +184,8 @@ int main(int argc, char **argv)
 			list = true;
 		else if (!strcmp(argv[i], "-q"))
 			quiet = true;
+		else if (!strcmp(argv[i], "-W"))
+			stop_on_wedge = true;
 		else if (!strcmp(argv[i], "-d") && i + 1 < argc)
 			index = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-R") && i + 1 < argc)
@@ -189,7 +198,7 @@ int main(int argc, char **argv)
 			if (sscanf(argv[++i], "%u-%u", &ch_first, &ch_last) == 1)
 				ch_last = ch_first;
 		} else {
-			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q]\n");
+			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W]\n");
 			return 2;
 		}
 	}
@@ -278,6 +287,8 @@ int main(int argc, char **argv)
 	bool have_first = false;
 	uint64_t start = now_ms(), last_stats = start;
 	uint32_t last_late[2] = { 0, 0 };
+	unsigned int idle_secs[2] = { 0, 0 };   /* consecutive seconds without completions, out / in */
+	bool wedged[2] = { false, false };
 
 	while (!quit && (!seconds || now_ms() - start < (uint64_t)seconds * 1000)) {
 		usleep(20000);
@@ -324,11 +335,27 @@ int main(int argc, char **argv)
 			struct ibus_stats s = ibus_take_stats(&bus);
 			double secs = hz ? (double)(host_time - first_host) / (double)hz : 0;
 			uint32_t late_out = shm->stats.dir[OZZY_PCM_OUT].late, late_in = shm->stats.dir[OZZY_PCM_IN].late;
-			fprintf(stderr, "clock %.1f Hz | out %u/s, in %u/s, errors %u | late out +%u in +%u%s\n",
-				secs > 0 ? (sample_time - first_sample) / secs : 0.0, s.out_done, s.in_done, s.errors,
-				late_out - last_late[0], late_in - last_late[1], lost ? " | input frames lost" : "");
+			struct timespec wall;
+			clock_gettime(CLOCK_REALTIME, &wall);
+			fprintf(stderr, "%ld.%03ld clock %.1f Hz | out %u/s, in %u/s, errors %u | late out +%u in +%u | "
+				"max gap out %u us, in %u us%s\n",
+				(long)wall.tv_sec, wall.tv_nsec / 1000000, secs > 0 ? (sample_time - first_sample) / secs : 0.0,
+				s.out_done, s.in_done, s.errors, late_out - last_late[0], late_in - last_late[1],
+				s.max_gap_out_us, s.max_gap_in_us, lost ? " | input frames lost" : "");
 			last_late[0] = late_out;
 			last_late[1] = late_in;
+			uint32_t done[2] = { s.out_done, s.in_done };
+			static const char *dir_name[2] = { "out", "in" };
+			for (int d = 0; d < 2; d++) {
+				idle_secs[d] = done[d] ? 0 : idle_secs[d] + 1;
+				if (idle_secs[d] >= 3 && !wedged[d]) {
+					wedged[d] = true;
+					fprintf(stderr, "WEDGED: PCM %s stopped completing at about %ld (3 s with none)\n",
+						dir_name[d], (long)wall.tv_sec - 3);
+				}
+			}
+			if (stop_on_wedge && (wedged[0] || wedged[1]))
+				quit = 1;
 		}
 	}
 

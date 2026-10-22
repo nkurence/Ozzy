@@ -50,6 +50,8 @@ struct iousb_bus {
 	dispatch_semaphore_t loop_ready;
 	atomic_int pending;
 	atomic_uint out_done, in_done, errors;
+	uint64_t last_done[2];                 /* mach time of the last completion, [0] out, [1] in */
+	atomic_uint_fast64_t max_gap[2];       /* longest gap since the last ibus_take_stats, mach ticks */
 
 	pthread_t timer_thread;
 	atomic_bool timer_on;
@@ -57,9 +59,11 @@ struct iousb_bus {
 	uint32_t timer_interval_us;
 };
 
-/* Completed transfers and failures per direction since the last call (harness stats) */
+/* Completed transfers and failures per direction since the last call, and the longest gap
+ * between two completions of a direction in that time (harness stats) */
 struct ibus_stats {
 	uint32_t out_done, in_done, errors;
+	uint32_t max_gap_out_us, max_gap_in_us;
 };
 
 /* The first present device with this vendor/product ID, or 0 (release it with IOObjectRelease) */
