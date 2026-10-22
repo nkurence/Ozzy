@@ -4,12 +4,13 @@
  * backend. It plays the HAL's part of the shared memory: a test tone in the output ring, the
  * input ring to a WAV file, MIDI in to the console. A port of tools/winusb-harness/main.c.
  *
- *   ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-q]
+ *   ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q]
  *     -l  list the supported devices found
  *     -d  the Nth of them (default 0)
  *     -R  sample rate in Hz (default: the device's default)
  *     -s  stop after this many seconds (default: Ctrl+C)
  *     -r  record the input to a 24-bit WAV file
+ *     -c  record only these input channels, 1-based (e.g. -c 15-16), for long runs
  *     -q  silence instead of the test tone
  */
 
@@ -169,6 +170,7 @@ int main(int argc, char **argv)
 	bool list = false, quiet = false;
 	int index = 0, seconds = 0;
 	uint32_t want_rate = 0;
+	unsigned int ch_first = 1, ch_last = 0;   /* 0: up to the device's last input */
 	const char *record = NULL;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-l"))
@@ -183,8 +185,11 @@ int main(int argc, char **argv)
 			seconds = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-r") && i + 1 < argc)
 			record = argv[++i];
-		else {
-			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-q]\n");
+		else if (!strcmp(argv[i], "-c") && i + 1 < argc) {
+			if (sscanf(argv[++i], "%u-%u", &ch_first, &ch_last) == 1)
+				ch_last = ch_first;
+		} else {
+			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q]\n");
 			return 2;
 		}
 	}
@@ -255,8 +260,16 @@ int main(int argc, char **argv)
 
 	struct wav wav = { 0 };
 	ploytec_frame_fn decode = in ? ploytec_frame_decoder(in) : NULL;
-	if (record && decode && !wav_open(&wav, record, rate, in))
+	if (!ch_last)
+		ch_last = in;
+	if (record && (ch_first < 1 || ch_last < ch_first || ch_last > in)) {
+		fprintf(stderr, "-c %u-%u: the device has inputs 1-%u\n", ch_first, ch_last, in);
+		record = NULL;
+	}
+	if (record && decode && !wav_open(&wav, record, rate, ch_last - ch_first + 1))
 		fprintf(stderr, "can't write %s\n", record);
+	else if (record && decode && (ch_first > 1 || ch_last < in))
+		fprintf(stderr, "recording inputs %u-%u\n", ch_first, ch_last);
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
@@ -302,7 +315,7 @@ int main(int argc, char **argv)
 			for (; next_frame < end; next_frame++) {
 				uint32_t f = (uint32_t)(next_frame % in_frames);
 				decode(s24, (const uint8_t *)shm->audio.input_buffer + f * PLOYTEC_IN_FRAME_SIZE);
-				wav_write(&wav, s24, 1);
+				wav_write(&wav, s24 + (ch_first - 1) * 3, 1);   /* the channels are contiguous */
 			}
 		}
 
