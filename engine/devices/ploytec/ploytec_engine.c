@@ -159,16 +159,22 @@ static bool ploytec_start(struct ozzy_engine *e)
 	e->settings.value[OZZY_SETTING_PCM_OUT_FRAMES] = (uint8_t)(pe->out_frames / 10 - 1);
 	e->settings.value[OZZY_SETTING_PCM_IN_FRAMES] = (uint8_t)(pe->in_frames / 8 - 1);
 	pe->out_queue = ozzy_pcm_queue(e->settings.value[OZZY_SETTING_PCM_OUT_QUEUE]);
-	pe->in_queue = ozzy_pcm_queue(e->settings.value[OZZY_SETTING_PCM_IN_QUEUE]);
-	/* What runs: one in flight (a setting stored before it went) runs as two */
-	e->settings.value[OZZY_SETTING_PCM_OUT_QUEUE] = (uint8_t)(pe->out_queue - 1);
-	e->settings.value[OZZY_SETTING_PCM_IN_QUEUE] = (uint8_t)(pe->in_queue - 1);
+	pe->in_queue = ozzy_pcm_queue_dir(true, e->settings.value[OZZY_SETTING_PCM_IN_QUEUE]);
 	out_places = ozzy_engine_pcm_layout(e, OZZY_PCM_OUT, ploytec_out_xfer_bytes(pe->out_layout, pe->out_frames));
 	in_places = ozzy_engine_pcm_layout(e, OZZY_PCM_IN, ploytec_in_xfer_bytes(pe->in_frames));
 	if (!out_places || !in_places) {
 		ploytec_log("PCM transfers of %u / %u frames don't fit", pe->out_frames, pe->in_frames);
 		return false;
 	}
+	/* No more in flight than places: a platform's own buffers (OZZY_PCM_OWN_SLOTS) can be fewer
+	 * than a build's in queue, and a place in flight twice would be filled twice at once */
+	if (pe->out_queue > out_places)
+		pe->out_queue = out_places;
+	if (pe->in_queue > in_places)
+		pe->in_queue = in_places;
+	/* What runs: one in flight (a setting stored before it went) runs as two */
+	e->settings.value[OZZY_SETTING_PCM_OUT_QUEUE] = (uint8_t)(pe->out_queue - 1);
+	e->settings.value[OZZY_SETTING_PCM_IN_QUEUE] = (uint8_t)(pe->in_queue - 1);
 	pe->anchor_frames = e->anchors ? ozzy_anchor_frames(e->settings.value[OZZY_SETTING_IO_BUFFER_MAX], pe->out_frames) : 0;
 
 	/* 1. The format, as the HAL reads it (the platform has set the device names) */

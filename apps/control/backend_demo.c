@@ -92,7 +92,7 @@ static void demo_transfers(struct ozzy_control_device *d)
 	bool isoc = in->output == OZZY_INFO_OUTPUT_ISOC;
 
 	uint32_t out_queue = ozzy_pcm_queue(d->settings.value[OZZY_SETTING_PCM_OUT_QUEUE]);
-	uint32_t in_queue = ozzy_pcm_queue(d->settings.value[OZZY_SETTING_PCM_IN_QUEUE]);
+	uint32_t in_queue = ozzy_pcm_queue_dir(true, d->settings.value[OZZY_SETTING_PCM_IN_QUEUE]);
 
 	in->transfer_frames[1] = ozzy_pcm_frames(true, d->settings.value[OZZY_SETTING_PCM_IN_FRAMES]);
 	/* As the engines do: the isochronous family at its defaults (80 frames, 2) as its output */
