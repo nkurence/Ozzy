@@ -6,6 +6,7 @@
 #include <CoreAudio/CoreAudioTypes.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h> // Required for Kext Communication
+#include <xpc/xpc.h>        // ozzyd, the userspace backend (../Shared/OzzyDaemonClient.h)
 #include <os/log.h>
 #include <atomic>
 #include <cstdint>
@@ -36,11 +37,16 @@ public:
     AudioObjectID GetOutputStreamID() const { return GetDeviceID() + 2; }
     AudioObjectID GetClockControlID() const { return GetDeviceID() + 3; }
 
-    // Connection to the kext (monitor thread)
+    // Connection to the driver, the kext or ozzyd (monitor thread)
     bool IsMapped() const { return mSHM.load(std::memory_order_relaxed) != nullptr; }
     bool IsUsed() const { return mDeviceUID != nullptr; }   // has been published before
     uint64_t GetRegistryID() const { return mRegistryID; }
     bool Map(io_connect_t connect, mach_vm_address_t address, mach_vm_size_t size, uint64_t registryID, uint32_t locationID);
+    // ozzyd's device @id, its shared memory mapped from the daemon's xpc_shmem (takes it over
+    // on success; the caller unmaps it otherwise)
+    bool MapDaemon(xpc_connection_t daemon, uint64_t id, void* address, size_t size, uint32_t locationID);
+    bool IsFromDaemon() const { return mDaemon != nullptr; }
+    bool HasDaemonSession(uint64_t id, uint32_t session) const { return mDaemon && mDaemonID == id && mSessionID == session; }
     void Unmap();
     bool CheckHealth();
     bool UpdateConnectionState(AudioServerPlugInHostRef host);   // true if it changed
@@ -190,12 +196,19 @@ private:
     uint64_t mRegistryID = 0;
     uint32_t mLocationID = 0;   // USB port (IOUSBHostDevice locationID)
     uint32_t mSessionID = 0;
+    // ozzyd connection instead of the kext's: the daemon (retained), its device id, the mapping
+    xpc_connection_t mDaemon = nullptr;
+    uint64_t mDaemonID = 0;
+    void* mDaemonMapAddress = nullptr;
+    size_t mDaemonMapSize = 0;
 
     alignas(16) uint8_t mChannelLayoutBuffer[0x50C];
 
     ozzy_shared_memory* AcquireSHM();
     void ReleaseSHM();
     void ApplyDeviceConfig();
+    bool Adopt(ozzy_shared_memory* shm, uint32_t locationID, const char* driver);
+    kern_return_t CallMethod(uint32_t method, uint64_t a0, uint64_t a1, uint32_t count);
     kern_return_t CallSetRate(uint32_t rate);
     kern_return_t CallApplySetting(unsigned int id, uint32_t value);
     CFStringRef CopySettingKey(unsigned int id) const;
@@ -231,10 +244,23 @@ private:
     std::atomic<bool> mMonitorRunning { false };
     bool mLoggedWaitingForDriver = false;
 
+    // ozzyd (monitor thread): the connection, and the generation of the last one that failed
+    // (its error handler runs on mDaemonQueue)
+    xpc_connection_t mDaemon = nullptr;
+    dispatch_queue_t mDaemonQueue = nullptr;
+    std::atomic<uint32_t> mDaemonGeneration { 0 };
+    std::atomic<uint32_t> mDaemonLostGeneration { 0 };
+    uint64_t mDaemonRetryAt = 0;   // ms of a steady clock
+    bool mDaemonReachable = false;
+    bool mLoggedNoDaemon = false;
+
     static void* MonitorEntry(void* arg);
     void MonitorLoop();
     void ScanServices();
     void ConnectService(io_service_t service, uint64_t registryID);
+    void ScanDaemon();
+    void ConnectDaemonDevice(uint64_t id, uint32_t locationID);
+    void DropDaemon();
     OzzyHALDevice* SlotForUID(const char* uid);
 };
 
