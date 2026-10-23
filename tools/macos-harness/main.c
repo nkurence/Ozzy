@@ -106,17 +106,68 @@ static int find_devices(struct found_device *found, int max)
 	return count;
 }
 
-/* 24-bit WAV writer (sizes patched on close) */
+/*
+ * 24-bit WAV writer (sizes patched on close). The reader hands it frames through a FIFO in memory
+ * and a thread of its own writes them to the file, so a disk that stalls can't make the reader
+ * fall behind the input ring (at 96 kHz the ring holds 169 ms; a write that blocked longer than
+ * half of that once cost 4,700 frames under load). A writer more than the FIFO behind drops
+ * frames, counted apart from the reader's.
+ */
+#define WAV_FIFO_BYTES (64u << 20)   /* 2 channels at 96 kHz: about two minutes; 16: about 14 s */
+
 struct wav {
 	FILE *f;
-	uint32_t channels, bytes;
+	uint32_t channels, bytes;      /* bytes: the writer thread's, read after it has finished */
+	uint8_t *fifo;
+	_Atomic uint64_t head, tail;   /* bytes put in by the reader, taken out by the writer, since open */
+	atomic_bool closing;
+	uint64_t dropped;              /* bytes the FIFO had no room for (the reader's) */
+	pthread_t writer;
 };
+
+static void *wav_writer(void *arg)
+{
+	struct wav *w = arg;
+	/* test: OZZY_WAV_STALL_MS=n blocks the writer once for n ms after its first 4 MiB, a disk that
+	 * stalls; the reader must lose nothing while the FIFO has room */
+	const char *stall_env = getenv("OZZY_WAV_STALL_MS");
+	unsigned int stall = stall_env ? (unsigned int)atoi(stall_env) : 0;
+	for (;;) {
+		if (stall && atomic_load_explicit(&w->tail, memory_order_relaxed) > (4u << 20)) {
+			fprintf(stderr, "WAV writer: stalling %u ms (OZZY_WAV_STALL_MS)\n", stall);
+			usleep(stall * 1000);
+			stall = 0;
+		}
+		uint64_t tail = atomic_load_explicit(&w->tail, memory_order_relaxed);
+		uint64_t head = atomic_load_explicit(&w->head, memory_order_acquire);
+		if (head == tail) {
+			/* closing is set after the last frame went in: read head again once it is */
+			if (atomic_load(&w->closing) && atomic_load(&w->head) == tail)
+				break;
+			usleep(10000);
+			continue;
+		}
+		uint64_t off = tail % WAV_FIFO_BYTES, n = head - tail;
+		if (n > WAV_FIFO_BYTES - off)
+			n = WAV_FIFO_BYTES - off;
+		w->bytes += (uint32_t)fwrite(w->fifo + off, 1, (size_t)n, w->f);
+		atomic_store_explicit(&w->tail, tail + n, memory_order_release);
+	}
+	return NULL;
+}
 
 static bool wav_open(struct wav *w, const char *name, uint32_t rate, uint32_t channels)
 {
-	w->f = fopen(name, "wb");
-	if (!w->f)
+	w->fifo = malloc(WAV_FIFO_BYTES);
+	if (!w->fifo)
 		return false;
+	memset(w->fifo, 0, WAV_FIFO_BYTES);   /* its pages in now, not as faults on the real-time reader */
+	w->f = fopen(name, "wb");
+	if (!w->f) {
+		free(w->fifo);
+		w->fifo = NULL;
+		return false;
+	}
 	w->channels = channels;
 	uint8_t h[44] = { 'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0 };
 	uint32_t block_align = channels * 3, byte_rate = rate * block_align;
@@ -127,18 +178,47 @@ static bool wav_open(struct wav *w, const char *name, uint32_t rate, uint32_t ch
 	h[34] = 24;
 	memcpy(h + 36, "data", 4);
 	fwrite(h, 1, sizeof(h), w->f);
+	if (pthread_create(&w->writer, NULL, wav_writer, w) != 0) {
+		fclose(w->f);
+		w->f = NULL;
+		free(w->fifo);
+		w->fifo = NULL;
+		return false;
+	}
 	return true;
 }
 
+/* The reader's side: into the FIFO, no system call */
 static void wav_write(struct wav *w, const uint8_t *s24, uint32_t frames)
 {
-	w->bytes += (uint32_t)fwrite(s24, 1, frames * w->channels * 3, w->f);
+	uint64_t n = (uint64_t)frames * w->channels * 3;
+	uint64_t head = atomic_load_explicit(&w->head, memory_order_relaxed);
+	uint64_t tail = atomic_load_explicit(&w->tail, memory_order_acquire);
+	if (head - tail + n > WAV_FIFO_BYTES) {
+		w->dropped += n;
+		return;
+	}
+	for (uint64_t i = 0; i < n;) {
+		uint64_t off = (head + i) % WAV_FIFO_BYTES, c = n - i;
+		if (c > WAV_FIFO_BYTES - off)
+			c = WAV_FIFO_BYTES - off;
+		memcpy(w->fifo + off, s24 + i, (size_t)c);
+		i += c;
+	}
+	atomic_store_explicit(&w->head, head + n, memory_order_release);
 }
 
 static void wav_close(struct wav *w)
 {
 	if (!w->f)
 		return;
+	atomic_store(&w->closing, true);
+	pthread_join(w->writer, NULL);
+	if (w->dropped)
+		fprintf(stderr, "frames the WAV writer had no room for: %llu\n",
+			(unsigned long long)(w->dropped / (w->channels * 3)));
+	free(w->fifo);
+	w->fifo = NULL;
 	uint32_t riff = 36 + w->bytes;
 	fseek(w->f, 4, SEEK_SET);
 	fwrite(&riff, 4, 1, w->f);
@@ -483,10 +563,11 @@ int main(int argc, char **argv)
 			struct timespec wall;
 			clock_gettime(CLOCK_REALTIME, &wall);
 			fprintf(stderr, "%ld.%03ld clock %.1f Hz | out %u/s, in %u/s, errors %u | late out +%u in +%u | "
-				"max gap out %u us, in %u us%s\n",
+				"max gap out %u us, in %u us%s%s\n",
 				(long)wall.tv_sec, wall.tv_nsec / 1000000, secs > 0 ? (sample_time - first_sample) / secs : 0.0,
 				s.out_done, s.in_done, s.errors, late_out - last_late[0], late_in - last_late[1],
-				s.max_gap_out_us, s.max_gap_in_us, lost ? " | input frames lost" : "");
+				s.max_gap_out_us, s.max_gap_in_us, lost ? " | input frames lost" : "",
+				wav.dropped ? " | WAV writer behind, frames dropped" : "");
 			last_late[0] = late_out;
 			last_late[1] = late_in;
 			uint32_t done[2] = { s.out_done, s.in_done };
