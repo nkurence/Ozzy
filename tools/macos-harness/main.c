@@ -29,6 +29,12 @@
  *         selects the interfaces' alternate setting again (which resets the endpoints on the
  *         device side) and starts it again with its handshake; each one is logged as RECOVERED
  *         or RECOVERY FAILED with how long it took, and counted in the engine's stats
+ *     -K  test: every 10 s, restart the engine as a rate or setting change does, one of three ways:
+ *         "plain" (ozzy_engine_restart, the kext's: suspend, start), "reselect" (suspend, the
+ *         interfaces' alternate setting 0 and then theirs, start: ozzyd's) or "reconfig" (suspend,
+ *         SET_CONFIGURATION 0 and 1 and the interfaces again, start: the official driver's, from
+ *         the DB4 capture). A restart after which both directions aren't completing within 3 s is
+ *         logged as wedged (with -A the watchdog then recovers it)
  *
  * With -r the reader that copies the input ring to the WAV runs under a real-time policy too,
  * so a loaded machine can't make it fall half a ring behind and drop frames (which shows in the
@@ -86,6 +92,8 @@ int main(int argc, char **argv)
 	bool list = false, quiet = false, stop_on_wedge = false, auto_recover = false;
 	unsigned int stall_ms = 0, xfer_frames = 0, in_queue = 0, out_queue = 0, rt_period = 0, rt_compute = 0;
 	bool rt_off = false;
+	enum { RESTART_NONE, RESTART_PLAIN, RESTART_RESELECT, RESTART_RECONFIG } restart_mode = RESTART_NONE;
+	static const char *restart_names[] = { "", "plain", "reselect", "reconfig" };
 	int index = 0, seconds = 0;
 	uint32_t want_rate = 0;
 	unsigned int ch_first = 1, ch_last = 0;   /* 0: up to the device's last input */
@@ -101,6 +109,15 @@ int main(int argc, char **argv)
 			auto_recover = true;
 		else if (!strcmp(argv[i], "-X") && i + 1 < argc)
 			stall_ms = (unsigned int)atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-K") && i + 1 < argc) {
+			const char *m = argv[++i];
+			restart_mode = !strcmp(m, "plain") ? RESTART_PLAIN : !strcmp(m, "reselect") ? RESTART_RESELECT
+				     : !strcmp(m, "reconfig") ? RESTART_RECONFIG : RESTART_NONE;
+			if (restart_mode == RESTART_NONE) {
+				fprintf(stderr, "-K: plain, reselect or reconfig\n");
+				return 2;
+			}
+		}
 		else if (!strcmp(argv[i], "-P") && i + 1 < argc) {
 			const char *p = argv[++i];
 			if (!strcmp(p, "off"))
@@ -141,7 +158,7 @@ int main(int argc, char **argv)
 			if (sscanf(argv[++i], "%u-%u", &ch_first, &ch_last) == 1)
 				ch_last = ch_first;
 		} else {
-			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-A] [-X ms] [-F frames] [-Q in_flight] [-O out_flight] [-P off|period:compute]\n");
+			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-A] [-X ms] [-K plain|reselect|reconfig] [-F frames] [-Q in_flight] [-O out_flight] [-P off|period:compute]\n");
 			return 2;
 		}
 	}
@@ -266,6 +283,7 @@ int main(int argc, char **argv)
 	uint64_t seen_at[2] = { start, start };
 	unsigned int recovered = 0, recovery_failed = 0;
 	uint64_t recovery_ms_max = 0, recovery_ms_sum = 0;
+	unsigned int restarts = 0, restarts_streaming = 0, restarts_failed = 0;
 
 	while (!quit && (!seconds || now_ms() - start < (uint64_t)seconds * 1000)) {
 		usleep(20000);
@@ -378,6 +396,41 @@ int main(int argc, char **argv)
 				fprintf(stderr, "STALL: freezing the completion thread for %u ms\n", stall_ms);
 				atomic_store(&bus.stall_ms, stall_ms);
 			}
+			static unsigned int restart_tick;
+			if (restart_mode && ++restart_tick % 10 == 5) {
+				fprintf(stderr, "%ld.%03ld RESTART (%s)\n", (long)wall.tv_sec, wall.tv_nsec / 1000000,
+					restart_names[restart_mode]);
+				uint64_t t0 = now_ms();
+				bool ok;
+				if (restart_mode == RESTART_PLAIN) {
+					ok = ozzy_engine_restart(engine);   /* stops the engine if the device didn't take it */
+				} else {
+					ozzy_engine_suspend(engine);
+					ok = (restart_mode == RESTART_RESELECT ? ibus_reselect(&bus) : ibus_reconfigure(&bus)) &&
+					     ozzy_engine_start(engine);
+				}
+				uint64_t base[2] = { atomic_load(&bus.total_done[0]), atomic_load(&bus.total_done[1]) };
+				while (ok && now_ms() - t0 < 3000 &&
+				       (atomic_load(&bus.total_done[0]) == base[0] || atomic_load(&bus.total_done[1]) == base[1]))
+					usleep(1000);
+				bool streaming = ok && atomic_load(&bus.total_done[0]) != base[0] &&
+						 atomic_load(&bus.total_done[1]) != base[1];
+				restarts++;
+				restarts_streaming += streaming;
+				restarts_failed += !ok;
+				fprintf(stderr, "RESTART %s after %llu ms\n",
+					streaming ? "streaming" : ok ? "NOT STREAMING (wedged)" : "FAILED",
+					(unsigned long long)(now_ms() - t0));
+				if (streaming) {   /* else the watchdog (-A) sees the old progress times and recovers */
+					seen_at[0] = seen_at[1] = now_ms();
+					seen_done[0] = atomic_load(&bus.total_done[0]);
+					seen_done[1] = atomic_load(&bus.total_done[1]);
+				}
+				reader.resync = true;
+				have_first = false;
+				if (out && !quiet)
+					fill_tone(shm, out, rate);   /* the start laid the output ring out again */
+			}
 		}
 	}
 
@@ -390,6 +443,10 @@ int main(int argc, char **argv)
 	print_stats(&final_stats);
 	if (reader.lost)
 		fprintf(stderr, "input frames lost by the WAV reader: %llu\n", (unsigned long long)reader.lost);
+	if (restart_mode)
+		fprintf(stderr, "restarts (%s): %u, streaming after %u, wedged after %u, failed %u\n",
+			restart_names[restart_mode], restarts, restarts_streaming, restarts - restarts_streaming - restarts_failed,
+			restarts_failed);
 	if (auto_recover)
 		fprintf(stderr, "recoveries: %u ok, %u failed; time to stream again: max %llu ms, mean %llu ms\n",
 			recovered, recovery_failed, (unsigned long long)recovery_ms_max,

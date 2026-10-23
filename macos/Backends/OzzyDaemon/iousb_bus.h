@@ -101,6 +101,12 @@ bool ibus_configure(struct iousb_bus *ib);
  * endpoints on the device side, and look the pipes up again. False if that failed. */
 bool ibus_reselect(struct iousb_bus *ib);
 
+/* As the official driver changes rate (DB4 Windows capture, .claude/re/ploytec_sample_rates.md
+ * §5a), with the engine suspended: close the interfaces, SET_CONFIGURATION 0, then configuration
+ * 1, the interfaces and their alternate setting again, and hand the endpoints to the engine
+ * again. False if that failed. */
+bool ibus_reconfigure(struct iousb_bus *ib);
+
 /* String descriptor @index (US English) as ASCII into @dst; false if there is none */
 bool ibus_get_string(struct iousb_bus *ib, uint8_t index, char *dst, size_t size);
 

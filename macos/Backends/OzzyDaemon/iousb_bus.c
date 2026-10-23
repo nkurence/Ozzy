@@ -619,6 +619,36 @@ bool ibus_reselect(struct iousb_bus *ib)
 	return ok;
 }
 
+bool ibus_reconfigure(struct iousb_bus *ib)
+{
+	/* The interfaces go with the configuration: their sources off the completion thread, then closed */
+	for (int i = 0; i < ib->intf_count; i++) {
+		if (ib->intf_source[i] && ib->completion_loop)
+			CFRunLoopRemoveSource(ib->completion_loop, ib->intf_source[i], kCFRunLoopDefaultMode);
+		ib->intf_source[i] = NULL;   /* owned by the interface */
+	}
+	for (int s = 0; s < IBUS_PIPE_SLOTS; s++) {
+		ib->pipe_intf[s] = NULL;
+		ib->pipe_ref[s] = 0;
+		ib->pipe_addr[s] = 0;
+	}
+	for (int i = ib->intf_count - 1; i >= 0; i--) {
+		if (ib->intf[i]) {
+			(*ib->intf[i])->USBInterfaceClose(ib->intf[i]);
+			(*ib->intf[i])->Release(ib->intf[i]);
+		}
+		ib->intf[i] = NULL;
+	}
+	ib->intf_count = 0;
+	IOReturn kr = (*ib->dev)->SetConfiguration(ib->dev, 0);
+	if (kr != kIOReturnSuccess) {
+		ibus_log("[IOUSBBus] SetConfiguration(0) failed: 0x%08x", kr);
+		return false;
+	}
+	ib->last_done[0] = ib->last_done[1] = 0;
+	return ibus_configure(ib);   /* configuration 1, the interfaces at their alternate setting, the endpoints */
+}
+
 bool ibus_get_string(struct iousb_bus *ib, uint8_t index, char *dst, size_t size)
 {
 	uint8_t buf[256];
