@@ -309,6 +309,40 @@ io_service_t ibus_find(uint16_t vid, uint16_t pid, int index)
 	return found;
 }
 
+static int registry_int(io_service_t s, CFStringRef key)
+{
+	int v = -1;
+	CFTypeRef ref = IORegistryEntryCreateCFProperty(s, key, kCFAllocatorDefault, 0);
+	if (ref) {
+		if (CFGetTypeID(ref) == CFNumberGetTypeID())
+			CFNumberGetValue(ref, kCFNumberIntType, &v);
+		CFRelease(ref);
+	}
+	return v;
+}
+
+int ibus_find_supported(struct ibus_found *found, int max)
+{
+	io_iterator_t it = 0;
+	if (IOServiceGetMatchingServices(MACH_PORT_NULL, IOServiceMatching("IOUSBHostDevice"), &it) != KERN_SUCCESS)
+		return 0;
+	int count = 0;
+	io_service_t s;
+	while ((s = IOIteratorNext(it))) {
+		int vid = registry_int(s, CFSTR("idVendor")), pid = registry_int(s, CFSTR("idProduct"));
+		const struct ozzy_device *model = vid >= 0 && pid >= 0 ? ozzy_device_lookup((uint16_t)vid, (uint16_t)pid) : NULL;
+		if (!model || count >= max) {
+			IOObjectRelease(s);
+			continue;
+		}
+		found[count].model = model;
+		found[count].service = s;
+		found[count++].location = (uint32_t)registry_int(s, CFSTR("locationID"));
+	}
+	IOObjectRelease(it);
+	return count;
+}
+
 bool ibus_open(struct iousb_bus *ib, io_service_t service, struct ozzy_engine *engine)
 {
 	ib->bus.ops = &ibus_ops;

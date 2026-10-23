@@ -28,9 +28,20 @@ tools/macos-harness/ozzy-harness -R 48000 -s 30            30 s at 48 kHz with t
 
 The test tone goes to the device's outputs 1/2. Turn the monitoring down before running without `-q`.
 
+## ozzyd-client
+
+The same HAL part (tone, input to WAV, `hal_role.c`) against [`ozzyd`](../../macos/Backends/OzzyDaemon/), the userspace backend, instead of an engine in its own process, with the harness's options. Settings reach the daemon as OzzyHAL's would (`OZZY_METHOD_SET_RATE` / `_APPLY_SETTING`), and `-X` asks the daemon for the stall (it takes test requests only with `-T`). The daemon logs the per-second line; the client prints the reader's side and, at the end, what the engine counted while it ran.
+
+```
+make -C macos/Backends/OzzyDaemon && macos/Backends/OzzyDaemon/ozzyd-agent.sh load
+tools/macos-harness/ozzyd-client -l
+tools/macos-harness/ozzyd-client -R 96000 -F 200 -Q 8 -O 8 -s 120 -r in.wav -c 15-16
+macos/Backends/OzzyDaemon/ozzyd-agent.sh unload
+```
+
 ## How it works
 
-`iousb_bus.c` fills in `struct ozzy_bus_ops` (`engine/core/ozzy_bus.h`):
+`iousb_bus.c` (in `macos/Backends/OzzyDaemon/`, which ozzyd runs on too) fills in `struct ozzy_bus_ops` (`engine/core/ozzy_bus.h`):
 
 - configuration 1 (with a 500 ms wait, as OzzyKext), then the profile's interfaces at its alternate setting, retrying for up to 2 s while their nubs appear
 - bulk and interrupt transfers as `ReadPipeAsync` / `WritePipeAsync`. Every completion runs on one thread, under the time-constraint policy, that runs the interfaces' async event sources, so engine callbacks never run concurrently with each other

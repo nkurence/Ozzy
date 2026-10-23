@@ -2,10 +2,10 @@
 #ifndef IOUSB_BUS_H
 #define IOUSB_BUS_H
 
-/* The engine's bus (engine/core/ozzy_bus.h) over IOUSBLib, for the macOS dev harness: the
- * engine runs in a command-line program and talks to the device from user space, with no
- * kext and SIP untouched. Not shipped (the macOS driver is the kext); it is also the
- * measurement for whether a userspace backend can stream cleanly.
+/* The engine's bus (engine/core/ozzy_bus.h) over IOUSBLib: the engine talks to the device from
+ * user space, with no kext and SIP untouched. ozzyd (the userspace backend, beside this file)
+ * runs on it, and so does the dev harness (tools/macos-harness), which is also the measurement
+ * for whether a userspace backend can stream cleanly.
  *
  * Transfers are IOUSBLib async pipe calls. Every completion is delivered on one real-time
  * thread that runs the interfaces' run loop sources, so engine callbacks never run
@@ -18,7 +18,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/usb/IOUSBLib.h>
-#include "../../engine/core/ozzy_engine.h"
+#include "../../../engine/core/ozzy_engine.h"
 
 enum {
 	IBUS_MAX_INTERFACES = 8,
@@ -76,6 +76,16 @@ struct ibus_stats {
 
 /* The first present device with this vendor/product ID, or 0 (release it with IOObjectRelease) */
 io_service_t ibus_find(uint16_t vid, uint16_t pid, int index);
+
+/* A present USB device that is in common/ozzy_devices.def */
+struct ibus_found {
+	const struct ozzy_device *model;
+	io_service_t service;   /* release it with IOObjectRelease */
+	uint32_t location;      /* locationID: Ploytec devices have no serial number */
+};
+
+/* The supported devices present, at most @max into @found; how many */
+int ibus_find_supported(struct ibus_found *found, int max);
 
 /* Open @service (takes a reference) and start the completion thread */
 bool ibus_open(struct iousb_bus *ib, io_service_t service, struct ozzy_engine *engine);

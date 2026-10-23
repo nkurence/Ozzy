@@ -41,13 +41,12 @@
  * never closes one. Without -A it stays wedged (the Windows driver resets the port).
  */
 
-#include "iousb_bus.h"
+#include "../../macos/Backends/OzzyDaemon/iousb_bus.h"
+#include "hal_role.h"
 #include "../../engine/core/ozzy_engine.h"
-#include "../../common/devices/ploytec/ploytec_protocol.h"
 #include "../../engine/shared/ozzy_shared_data.h"
 #include "../../common/devices/ploytec/ploytec_codec.h"
 #include "../../common/ozzy_version.h"
-#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,196 +62,6 @@ static void on_signal(int sig)
 {
 	(void)sig;
 	quit = 1;
-}
-
-struct found_device {
-	const struct ozzy_device *model;
-	io_service_t service;
-	uint32_t location;
-};
-
-static int registry_int(io_service_t s, CFStringRef key)
-{
-	int v = -1;
-	CFTypeRef ref = IORegistryEntryCreateCFProperty(s, key, kCFAllocatorDefault, 0);
-	if (ref) {
-		if (CFGetTypeID(ref) == CFNumberGetTypeID())
-			CFNumberGetValue(ref, kCFNumberIntType, &v);
-		CFRelease(ref);
-	}
-	return v;
-}
-
-/* Present USB devices that are in common/ozzy_devices.def, at most @max into @found */
-static int find_devices(struct found_device *found, int max)
-{
-	io_iterator_t it = 0;
-	if (IOServiceGetMatchingServices(MACH_PORT_NULL, IOServiceMatching("IOUSBHostDevice"), &it) != KERN_SUCCESS)
-		return 0;
-	int count = 0;
-	io_service_t s;
-	while ((s = IOIteratorNext(it))) {
-		int vid = registry_int(s, CFSTR("idVendor")), pid = registry_int(s, CFSTR("idProduct"));
-		const struct ozzy_device *model = vid >= 0 && pid >= 0 ? ozzy_device_lookup((uint16_t)vid, (uint16_t)pid) : NULL;
-		if (!model || count >= max) {
-			IOObjectRelease(s);
-			continue;
-		}
-		found[count].model = model;
-		found[count].service = s;
-		found[count++].location = (uint32_t)registry_int(s, CFSTR("locationID"));
-	}
-	IOObjectRelease(it);
-	return count;
-}
-
-/*
- * 24-bit WAV writer (sizes patched on close). The reader hands it frames through a FIFO in memory
- * and a thread of its own writes them to the file, so a disk that stalls can't make the reader
- * fall behind the input ring (at 96 kHz the ring holds 169 ms; a write that blocked longer than
- * half of that once cost 4,700 frames under load). A writer more than the FIFO behind drops
- * frames, counted apart from the reader's.
- */
-#define WAV_FIFO_BYTES (64u << 20)   /* 2 channels at 96 kHz: about two minutes; 16: about 14 s */
-
-struct wav {
-	FILE *f;
-	uint32_t channels, bytes;      /* bytes: the writer thread's, read after it has finished */
-	uint8_t *fifo;
-	_Atomic uint64_t head, tail;   /* bytes put in by the reader, taken out by the writer, since open */
-	atomic_bool closing;
-	uint64_t dropped;              /* bytes the FIFO had no room for (the reader's) */
-	pthread_t writer;
-};
-
-static void *wav_writer(void *arg)
-{
-	struct wav *w = arg;
-	/* test: OZZY_WAV_STALL_MS=n blocks the writer once for n ms after its first 4 MiB, a disk that
-	 * stalls; the reader must lose nothing while the FIFO has room */
-	const char *stall_env = getenv("OZZY_WAV_STALL_MS");
-	unsigned int stall = stall_env ? (unsigned int)atoi(stall_env) : 0;
-	for (;;) {
-		if (stall && atomic_load_explicit(&w->tail, memory_order_relaxed) > (4u << 20)) {
-			fprintf(stderr, "WAV writer: stalling %u ms (OZZY_WAV_STALL_MS)\n", stall);
-			usleep(stall * 1000);
-			stall = 0;
-		}
-		uint64_t tail = atomic_load_explicit(&w->tail, memory_order_relaxed);
-		uint64_t head = atomic_load_explicit(&w->head, memory_order_acquire);
-		if (head == tail) {
-			/* closing is set after the last frame went in: read head again once it is */
-			if (atomic_load(&w->closing) && atomic_load(&w->head) == tail)
-				break;
-			usleep(10000);
-			continue;
-		}
-		uint64_t off = tail % WAV_FIFO_BYTES, n = head - tail;
-		if (n > WAV_FIFO_BYTES - off)
-			n = WAV_FIFO_BYTES - off;
-		w->bytes += (uint32_t)fwrite(w->fifo + off, 1, (size_t)n, w->f);
-		atomic_store_explicit(&w->tail, tail + n, memory_order_release);
-	}
-	return NULL;
-}
-
-static bool wav_open(struct wav *w, const char *name, uint32_t rate, uint32_t channels)
-{
-	w->fifo = malloc(WAV_FIFO_BYTES);
-	if (!w->fifo)
-		return false;
-	memset(w->fifo, 0, WAV_FIFO_BYTES);   /* its pages in now, not as faults on the real-time reader */
-	w->f = fopen(name, "wb");
-	if (!w->f) {
-		free(w->fifo);
-		w->fifo = NULL;
-		return false;
-	}
-	w->channels = channels;
-	uint8_t h[44] = { 'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0 };
-	uint32_t block_align = channels * 3, byte_rate = rate * block_align;
-	h[22] = (uint8_t)channels;
-	memcpy(h + 24, &rate, 4);
-	memcpy(h + 28, &byte_rate, 4);
-	h[32] = (uint8_t)block_align;
-	h[34] = 24;
-	memcpy(h + 36, "data", 4);
-	fwrite(h, 1, sizeof(h), w->f);
-	if (pthread_create(&w->writer, NULL, wav_writer, w) != 0) {
-		fclose(w->f);
-		w->f = NULL;
-		free(w->fifo);
-		w->fifo = NULL;
-		return false;
-	}
-	return true;
-}
-
-/* The reader's side: into the FIFO, no system call */
-static void wav_write(struct wav *w, const uint8_t *s24, uint32_t frames)
-{
-	uint64_t n = (uint64_t)frames * w->channels * 3;
-	uint64_t head = atomic_load_explicit(&w->head, memory_order_relaxed);
-	uint64_t tail = atomic_load_explicit(&w->tail, memory_order_acquire);
-	if (head - tail + n > WAV_FIFO_BYTES) {
-		w->dropped += n;
-		return;
-	}
-	for (uint64_t i = 0; i < n;) {
-		uint64_t off = (head + i) % WAV_FIFO_BYTES, c = n - i;
-		if (c > WAV_FIFO_BYTES - off)
-			c = WAV_FIFO_BYTES - off;
-		memcpy(w->fifo + off, s24 + i, (size_t)c);
-		i += c;
-	}
-	atomic_store_explicit(&w->head, head + n, memory_order_release);
-}
-
-static void wav_close(struct wav *w)
-{
-	if (!w->f)
-		return;
-	atomic_store(&w->closing, true);
-	pthread_join(w->writer, NULL);
-	if (w->dropped)
-		fprintf(stderr, "frames the WAV writer had no room for: %llu\n",
-			(unsigned long long)(w->dropped / (w->channels * 3)));
-	free(w->fifo);
-	w->fifo = NULL;
-	uint32_t riff = 36 + w->bytes;
-	fseek(w->f, 4, SEEK_SET);
-	fwrite(&riff, 4, 1, w->f);
-	fseek(w->f, 40, SEEK_SET);
-	fwrite(&w->bytes, 4, 1, w->f);
-	fclose(w->f);
-	w->f = NULL;
-}
-
-/* Frame @f of the output ring: sub-packets of 10 frames end to end in the device's layout */
-static uint8_t *out_frame(struct ozzy_shared_memory *shm, enum ploytec_out_layout layout, uint32_t f)
-{
-	return (uint8_t *)shm->audio.output_buffer + (f / PLOYTEC_FRAMES_PER_OUT_SUBPKT) * ploytec_out_subpkt_size(layout) +
-	       ploytec_out_frame_offset(layout, f % PLOYTEC_FRAMES_PER_OUT_SUBPKT);
-}
-
-/* A -18 dBFS sine on outputs 1 and 2 with a whole number of cycles in the output ring, as the
- * WinUSB harness */
-static double fill_tone(struct ozzy_shared_memory *shm, uint32_t channels, uint32_t rate)
-{
-	const uint32_t ring_frames = shm->audio.output_ring_frames;
-	ploytec_frame_f32_enc_fn encode = ploytec_frame_encoder_f32(channels);
-	if (!encode || !ring_frames)
-		return 0;
-	enum ploytec_out_layout layout = (shm->audio.device_flags & OZZY_DEVICE_FLAG_PLOYTEC_BULK) ? PLOYTEC_OUT_LAYOUT_BULK
-												: PLOYTEC_OUT_LAYOUT_INT;
-	const uint32_t cycles = 48;
-	float frame[16] = { 0 };
-	for (uint32_t f = 0; f < ring_frames; f++) {
-		float v = 0.125f * (float)sin(2.0 * 3.14159265358979 * cycles * f / ring_frames);
-		frame[0] = frame[1] = v;
-		encode(out_frame(shm, layout, f), frame);
-	}
-	return (double)cycles * rate / ring_frames;
 }
 
 static uint64_t now_ms(void)
@@ -338,8 +147,8 @@ int main(int argc, char **argv)
 	}
 	fprintf(stderr, "ozzy-harness for macOS (build %s)\n", OZZY_GIT_VERSION);
 
-	static struct found_device devices[MAX_FOUND];
-	int device_count = find_devices(devices, MAX_FOUND);
+	static struct ibus_found devices[MAX_FOUND];
+	int device_count = ibus_find_supported(devices, MAX_FOUND);
 	for (int i = 0; list && i < device_count; i++)
 		fprintf(stderr, "%d: %s (%04x:%04x), location 0x%08x%s\n", i, devices[i].model->name, devices[i].model->vid,
 			devices[i].model->pid, devices[i].location,
@@ -350,7 +159,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "no supported device found (-l lists them)\n");
 		return 1;
 	}
-	const struct found_device *found = &devices[index];
+	const struct ibus_found *found = &devices[index];
 	const struct ozzy_device *model = found->model;
 	if (model->family == OZZY_FAMILY_PLOYTEC_ISOC) {
 		fprintf(stderr, "%s streams isochronous OUT, which this harness doesn't do yet\n", model->name);
@@ -429,6 +238,7 @@ int main(int argc, char **argv)
 
 	struct wav wav = { 0 };
 	ploytec_frame_fn decode = in ? ploytec_frame_decoder(in) : NULL;
+	struct input_reader reader = { .decode = decode, .ch_first = ch_first };
 	if (!ch_last)
 		ch_last = in;
 	if (record && (ch_first < 1 || ch_last < ch_first || ch_last > in)) {
@@ -442,10 +252,10 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
-	if (wav.f)   /* the reader: 20 ms apart, a fraction of that to copy what came in */
-		ibus_make_realtime(20000, 2000);
+	if (wav.f)
+		input_reader_make_realtime();
 	const uint64_t hz = bus.bus.ops->time_hz(&bus);
-	uint64_t first_sample = 0, first_host = 0, next_frame = 0, lost = 0;
+	uint64_t first_sample = 0, first_host = 0;
 	bool have_first = false;
 	uint64_t start = now_ms(), last_stats = start;
 	uint32_t last_late[2] = { 0, 0 };
@@ -456,7 +266,6 @@ int main(int argc, char **argv)
 	uint64_t seen_at[2] = { start, start };
 	unsigned int recovered = 0, recovery_failed = 0;
 	uint64_t recovery_ms_max = 0, recovery_ms_sum = 0;
-	bool resync = false;   /* the reader takes up from the current position after a restart */
 
 	while (!quit && (!seconds || now_ms() - start < (uint64_t)seconds * 1000)) {
 		usleep(20000);
@@ -508,7 +317,7 @@ int main(int argc, char **argv)
 			seen_at[0] = seen_at[1] = now_ms();
 			seen_done[0] = atomic_load(&bus.total_done[0]);
 			seen_done[1] = atomic_load(&bus.total_done[1]);
-			resync = true;
+			reader.resync = true;   /* the reader takes up from the current position */
 			have_first = false;
 			if (!ok)
 				break;
@@ -533,27 +342,9 @@ int main(int argc, char **argv)
 			first_host = host_time;
 		}
 
-		/* Input up to the input safety offset before the anchor (the IN transfers run alongside
-		 * the OUT ones); the ring: one PLOYTEC_IN_FRAME_SIZE frame after another */
-		if (wav.f) {
-			const uint32_t in_frames = shm->audio.input_ring_frames ? shm->audio.input_ring_frames : 1;
-			const uint32_t behind = shm->audio.input_safety_offset_frames;
-			uint64_t end = sample_time > behind ? sample_time - behind : 0;
-			if (resync) {   /* after a restart: take up from here (the gap shows in the WAV) */
-				next_frame = end;
-				resync = false;
-			}
-			if (end > next_frame + in_frames / 2) {
-				lost += end - in_frames / 2 - next_frame;
-				next_frame = end - in_frames / 2;
-			}
-			uint8_t s24[16 * 3];
-			for (; next_frame < end; next_frame++) {
-				uint32_t f = (uint32_t)(next_frame % in_frames);
-				decode(s24, (const uint8_t *)shm->audio.input_buffer + f * PLOYTEC_IN_FRAME_SIZE);
-				wav_write(&wav, s24 + (ch_first - 1) * 3, 1);   /* the channels are contiguous */
-			}
-		}
+		/* Input up to the input safety offset before the anchor */
+		if (wav.f)
+			input_reader_run(&reader, shm, &wav, sample_time);
 
 		if (now_ms() - last_stats >= 1000) {
 			last_stats = now_ms();
@@ -566,7 +357,7 @@ int main(int argc, char **argv)
 				"max gap out %u us, in %u us%s%s\n",
 				(long)wall.tv_sec, wall.tv_nsec / 1000000, secs > 0 ? (sample_time - first_sample) / secs : 0.0,
 				s.out_done, s.in_done, s.errors, late_out - last_late[0], late_in - last_late[1],
-				s.max_gap_out_us, s.max_gap_in_us, lost ? " | input frames lost" : "",
+				s.max_gap_out_us, s.max_gap_in_us, reader.lost ? " | input frames lost" : "",
 				wav.dropped ? " | WAV writer behind, frames dropped" : "");
 			last_late[0] = late_out;
 			last_late[1] = late_in;
@@ -597,8 +388,8 @@ int main(int argc, char **argv)
 	wav_close(&wav);
 	fprintf(stderr, "engine stats:\n");
 	print_stats(&final_stats);
-	if (lost)
-		fprintf(stderr, "input frames lost by the WAV reader: %llu\n", (unsigned long long)lost);
+	if (reader.lost)
+		fprintf(stderr, "input frames lost by the WAV reader: %llu\n", (unsigned long long)reader.lost);
 	if (auto_recover)
 		fprintf(stderr, "recoveries: %u ok, %u failed; time to stream again: max %llu ms, mean %llu ms\n",
 			recovered, recovery_failed, (unsigned long long)recovery_ms_max,
