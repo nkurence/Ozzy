@@ -321,6 +321,18 @@ static int registry_int(io_service_t s, CFStringRef key)
 	return v;
 }
 
+bool ibus_identify(io_service_t s, struct ibus_found *found)
+{
+	int vid = registry_int(s, CFSTR("idVendor")), pid = registry_int(s, CFSTR("idProduct"));
+	const struct ozzy_device *model = vid >= 0 && pid >= 0 ? ozzy_device_lookup((uint16_t)vid, (uint16_t)pid) : NULL;
+	if (!model)
+		return false;
+	found->model = model;
+	found->service = s;
+	found->location = (uint32_t)registry_int(s, CFSTR("locationID"));
+	return true;
+}
+
 int ibus_find_supported(struct ibus_found *found, int max)
 {
 	io_iterator_t it = 0;
@@ -329,15 +341,10 @@ int ibus_find_supported(struct ibus_found *found, int max)
 	int count = 0;
 	io_service_t s;
 	while ((s = IOIteratorNext(it))) {
-		int vid = registry_int(s, CFSTR("idVendor")), pid = registry_int(s, CFSTR("idProduct"));
-		const struct ozzy_device *model = vid >= 0 && pid >= 0 ? ozzy_device_lookup((uint16_t)vid, (uint16_t)pid) : NULL;
-		if (!model || count >= max) {
+		if (count < max && ibus_identify(s, &found[count]))
+			count++;
+		else
 			IOObjectRelease(s);
-			continue;
-		}
-		found[count].model = model;
-		found[count].service = s;
-		found[count++].location = (uint32_t)registry_int(s, CFSTR("locationID"));
 	}
 	IOObjectRelease(it);
 	return count;

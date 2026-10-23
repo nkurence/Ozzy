@@ -11,11 +11,13 @@
  * WZ4 needs it: when its output runs dry it stops answering both pipes until then (measured,
  * tools/macos-harness/main.c).
  *
- * So far: the devices present at launch, and the service in the launching user's domain (a
- * LaunchAgent, ozzyd-agent.sh), which a test client can reach but CoreAudio's driver helpers,
- * which run as _coreaudiod, can't: OzzyHAL needs it in the system domain, as a LaunchDaemon. Not
- * yet: devices that arrive or leave later, settings kept across restarts, checking who connects,
- * a kext that already holds a device.
+ * Devices are taken as they arrive (IOKit matching on the supported USB IDs) and let go when they
+ * leave; OzzyHAL sees one leave by its shared memory's magic going to 0. XPC requests and device
+ * arrivals and departures run one at a time, on one queue. OzzyHAL reaches the service only in
+ * the system domain (install-daemon.sh: a LaunchDaemon), since CoreAudio's driver helpers run as
+ * _coreaudiod; ozzyd-agent.sh runs it in a user's domain for a test client. Not yet: checking who
+ * connects, a kext that already holds a device. Device settings are the HAL's to restore: it
+ * stores them and applies them again when a device comes back.
  *
  *   ozzyd [-v] [-T]
  *     -v  every second, per device, the dev harness's line: the device clock, PCM transfers per
@@ -28,6 +30,7 @@
 #include "../../../engine/core/ozzy_engine.h"
 #include "../../../engine/shared/ozzy_shared_data.h"
 #include "../../../common/ozzy_version.h"
+#include <IOKit/IOMessage.h>
 #include <mach/mach_time.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -45,6 +48,9 @@ enum {
 };
 
 struct device {
+	bool present;                      /* the slot is in use (on the queue) */
+	io_object_t interest;              /* its departure notification */
+	atomic_bool stop;                  /* the monitor thread ends */
 	const struct ozzy_device *model;
 	uint32_t location;
 	struct iousb_bus bus;
@@ -64,10 +70,10 @@ struct device {
 	uint64_t retry_at;
 };
 
-static struct device devices[MAX_DEVICES];
-static int device_count;
+static struct device devices[MAX_DEVICES];   /* by id, the slot index */
+static dispatch_queue_t queue;               /* XPC requests, device arrivals and departures */
+static IONotificationPortRef notify_port;
 static bool verbose, test_requests;
-static atomic_bool quitting;
 
 static uint64_t now_ms(void)
 {
@@ -165,7 +171,7 @@ static void *monitor(void *arg)
 	bool have_first = false, wedged[2] = { false, false };
 	static const char *dir_name[2] = { "out", "in" };
 
-	while (!atomic_load(&quitting)) {
+	while (!atomic_load(&d->stop)) {
 		usleep(20000);
 
 		pthread_mutex_lock(&d->lock);
@@ -291,14 +297,16 @@ static void handle_message(xpc_connection_t peer, xpc_object_t message)
 	xpc_object_t reply = xpc_dictionary_create_reply(message);   /* NULL for a one-way message */
 	uint64_t op = xpc_dictionary_get_uint64(message, OZZYD_KEY_OP);
 	uint64_t id = xpc_dictionary_get_uint64(message, OZZYD_KEY_ID);
-	struct device *d = id < (uint64_t)device_count ? &devices[id] : NULL;
+	struct device *d = id < MAX_DEVICES && devices[id].present ? &devices[id] : NULL;
 	int64_t ret = kIOReturnSuccess;
 
 	switch (op) {
 	case OZZYD_OP_LIST: {
 		xpc_object_t list = xpc_array_create(NULL, 0);
-		for (int i = 0; i < device_count; i++) {
+		for (int i = 0; i < MAX_DEVICES; i++) {
 			const struct device *e = &devices[i];
+			if (!e->present)
+				continue;
 			xpc_object_t entry = xpc_dictionary_create(NULL, NULL, 0);
 			xpc_dictionary_set_uint64(entry, OZZYD_KEY_ID, (uint64_t)i);
 			xpc_dictionary_set_uint64(entry, OZZYD_KEY_LOCATION, e->location);
@@ -355,7 +363,8 @@ static void log_stats(const struct device *d)
 
 static void close_device(struct device *d)
 {
-	if (d->monitor_running) {   /* quitting is set */
+	atomic_store(&d->stop, true);
+	if (d->monitor_running) {   /* it waits for a recovery in progress */
 		pthread_join(d->monitor, NULL);
 		d->monitor_running = false;
 	}
@@ -437,12 +446,87 @@ static bool open_device(struct device *d, const struct ibus_found *found)
 	return true;
 }
 
+/* On the queue: let a device go and free its slot */
+static void remove_device(struct device *d, const char *why)
+{
+	log_line("%s: %s", d->model->name, why);
+	close_device(d);
+	if (d->interest)
+		IOObjectRelease(d->interest);
+	pthread_mutex_destroy(&d->lock);
+	memset(d, 0, sizeof(*d));
+}
+
+/* A device we drive went away: unplugged, or gone across a sleep */
+static void device_interest(void *refcon, io_service_t service, natural_t type, void *arg)
+{
+	struct device *d = refcon;
+	if (type == kIOMessageServiceIsTerminated && d->present)
+		remove_device(d, "disconnected");
+}
+
+/* On the queue: take a USB device that arrived, if it's one we drive and nobody has it yet. Right
+ * after a plug-in it may not take the configuration yet, so a failure is tried twice more, a
+ * second apart. */
+static void add_device(io_service_t service, int attempt)
+{
+	struct ibus_found found;
+	if (!ibus_identify(service, &found))
+		return;
+	for (int i = 0; i < MAX_DEVICES; i++) {
+		if (devices[i].present && devices[i].location == found.location)
+			return;
+	}
+	struct device *d = NULL;
+	for (int i = 0; i < MAX_DEVICES && !d; i++) {
+		if (!devices[i].present)
+			d = &devices[i];
+	}
+	if (!d) {
+		log_line("%s: no free slot (%d devices)", found.model->name, MAX_DEVICES);
+		return;
+	}
+	memset(d, 0, sizeof(*d));
+	if (!open_device(d, &found)) {
+		close_device(d);
+		pthread_mutex_destroy(&d->lock);
+		memset(d, 0, sizeof(*d));
+		if (attempt >= 3) {
+			log_line("%s: not driven", found.model->name);
+			return;
+		}
+		log_line("%s: not ready, trying again in 1 s", found.model->name);
+		IOObjectRetain(service);
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), queue, ^{
+			add_device(service, attempt + 1);
+			IOObjectRelease(service);
+		});
+		return;
+	}
+	d->present = true;
+	if (IOServiceAddInterestNotification(notify_port, service, kIOGeneralInterest, device_interest, d, &d->interest) !=
+	    KERN_SUCCESS)
+		log_line("%s: no departure notification", found.model->name);
+}
+
+static void devices_arrived(void *refcon, io_iterator_t it)
+{
+	io_service_t s;
+	while ((s = IOIteratorNext(it))) {
+		add_device(s, 1);
+		IOObjectRelease(s);   /* ibus_open took its own reference */
+	}
+}
+
 static void shut_down(int sig)
 {
 	log_line("signal %d: stopping", sig);
-	atomic_store(&quitting, true);
-	for (int i = 0; i < device_count; i++)
-		close_device(&devices[i]);
+	dispatch_sync(queue, ^{
+		for (int i = 0; i < MAX_DEVICES; i++) {
+			if (devices[i].present)
+				remove_device(&devices[i], "stopping");
+		}
+	});
 	exit(0);
 }
 
@@ -460,22 +544,24 @@ int main(int argc, char **argv)
 	}
 	log_line("ozzyd for macOS (build %s), pid %d%s", OZZY_GIT_VERSION, getpid(), test_requests ? ", test requests on" : "");
 
-	struct ibus_found found[MAX_DEVICES];
-	int n = ibus_find_supported(found, MAX_DEVICES);
-	for (int i = 0; i < n; i++) {
-		struct device *d = &devices[device_count];
-		if (open_device(d, &found[i])) {
-			device_count++;
-		} else {
-			log_line("%s: not driven", found[i].model->name);
-			close_device(d);
-			memset(d, 0, sizeof(*d));
-		}
-		IOObjectRelease(found[i].service);   /* ibus_open took its own reference */
+	/* Devices: the ones there now, then each one that arrives */
+	queue = dispatch_queue_create("com.ozzy.daemon", DISPATCH_QUEUE_SERIAL);
+	notify_port = IONotificationPortCreate(MACH_PORT_NULL);
+	IONotificationPortSetDispatchQueue(notify_port, queue);
+	io_iterator_t arrivals = 0;
+	if (IOServiceAddMatchingNotification(notify_port, kIOFirstMatchNotification, IOServiceMatching("IOUSBHostDevice"),
+					     devices_arrived, NULL, &arrivals) != KERN_SUCCESS) {
+		log_line("no USB device notifications");
+		return 1;
 	}
-	log_line("%d device%s", device_count, device_count == 1 ? "" : "s");
+	dispatch_sync(queue, ^{
+		devices_arrived(NULL, arrivals);   /* also arms the notification */
+		int n = 0;
+		for (int i = 0; i < MAX_DEVICES; i++)
+			n += devices[i].present;
+		log_line("%d device%s", n, n == 1 ? "" : "s");
+	});
 
-	dispatch_queue_t queue = dispatch_queue_create("com.ozzy.daemon.xpc", DISPATCH_QUEUE_SERIAL);
 	xpc_connection_t listener = xpc_connection_create_mach_service(OZZYD_SERVICE, queue,
 								      XPC_CONNECTION_MACH_SERVICE_LISTENER);
 	xpc_connection_set_event_handler(listener, ^(xpc_object_t peer) {

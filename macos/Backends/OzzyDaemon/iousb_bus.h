@@ -84,6 +84,10 @@ struct ibus_found {
 	uint32_t location;      /* locationID: Ploytec devices have no serial number */
 };
 
+/* Whether the USB device @s is in common/ozzy_devices.def, and if so what (@found->service = @s,
+ * no reference taken) */
+bool ibus_identify(io_service_t s, struct ibus_found *found);
+
 /* The supported devices present, at most @max into @found; how many */
 int ibus_find_supported(struct ibus_found *found, int max);
 
