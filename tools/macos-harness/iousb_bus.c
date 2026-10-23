@@ -88,6 +88,12 @@ static void ibus_complete(void *refcon, IOReturn result, void *arg0)
 	int status = result == kIOReturnSuccess ? 0 : (int)result;
 	free(t);
 
+	if (pipe == 0x05 || pipe == 0x86) {   /* what was in flight, and what a reset had to abort */
+		int d = (pipe & 0x80) ? 1 : 0;
+		atomic_fetch_sub(&ib->pcm_in_flight[d], 1);
+		if (result == kIOReturnAborted)
+			atomic_fetch_add(&ib->pcm_aborted[d], 1);
+	}
 	if (status == 0) {
 		int dir = (pipe & 0x80) ? 1 : 0;
 		uint64_t now = mach_absolute_time();
@@ -124,13 +130,19 @@ static bool ibus_submit(void *ctx, uint8_t pipe, void *buf, uint32_t size, void 
 	t->ib = ib;
 	t->pipe = pipe;
 	t->xfer = xfer;
+	bool pcm = pipe == 0x05 || pipe == 0x86;
+	int d = (pipe & 0x80) ? 1 : 0;
 	atomic_fetch_add(&ib->pending, 1);
+	if (pcm)
+		atomic_fetch_add(&ib->pcm_in_flight[d], 1);
 	IOReturn r = (pipe & 0x80)
 		? (*intf)->ReadPipeAsync(intf, ib->pipe_ref[slot], buf, size, ibus_complete, t)
 		: (*intf)->WritePipeAsync(intf, ib->pipe_ref[slot], buf, size, ibus_complete, t);
 	if (r != kIOReturnSuccess) {
 		ibus_log("[IOUSBBus] pipe 0x%02x submit failed: 0x%08x", pipe, r);
 		atomic_fetch_sub(&ib->pending, 1);
+		if (pcm)
+			atomic_fetch_sub(&ib->pcm_in_flight[d], 1);
 		free(t);
 		return false;
 	}

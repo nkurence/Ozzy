@@ -15,10 +15,14 @@
  *     -W  stop when a PCM direction stops completing for 3 s (a wedge), instead of running on
  *     -X  test: every 10 s, freeze the completion thread for this many ms (a host that stops
  *         serving the device), to find whether and when a service gap wedges it
- *     -F  frames per PCM transfer, both ways (a multiple of 40, up to 200; default 80): with 4
- *         transfers in flight, the gap the device survives is 4 x frames
- *     -Q  PCM IN transfers in flight (2 to OZZY_NUM_PCM_IN_QUEUES, 8 in this build; default 4).
- *         In, every one but the first is margin, not latency: the gap IN survives is Q x frames
+ *     -F  frames per PCM transfer, both ways (a multiple of 40, up to 200; default 80)
+ *     -Q  PCM IN transfers in flight (2 to 8 in this build; default 4). In, every one but the
+ *         first is margin, not latency: a gap in service longer than Q x frames overflows the
+ *         device and loses input (a click), and that is all it does
+ *     -O  PCM OUT transfers in flight (2 to 8 in this build; default 4), each one latency. A gap
+ *         longer than about O x frames runs the device dry, which on the WZ4 also stops its IN
+ *         side for good (the wedge; -A recovers it): measured, IN 8 / OUT 2 wedged 6 of 6, IN 2 /
+ *         OUT 4 at the same gaps 0 of 6
  *     -P  the completion thread's real-time policy: "off", or period_us:compute_us
  *         (default 1000:250), for measuring how the policy shapes the gaps
  *     -A  recover a wedge: a PCM direction with no completions for 0.5 s suspends the engine,
@@ -191,7 +195,7 @@ static void print_stats(const struct ozzy_stats *st)
 int main(int argc, char **argv)
 {
 	bool list = false, quiet = false, stop_on_wedge = false, auto_recover = false;
-	unsigned int stall_ms = 0, xfer_frames = 0, in_queue = 0, rt_period = 0, rt_compute = 0;
+	unsigned int stall_ms = 0, xfer_frames = 0, in_queue = 0, out_queue = 0, rt_period = 0, rt_compute = 0;
 	bool rt_off = false;
 	int index = 0, seconds = 0;
 	uint32_t want_rate = 0;
@@ -229,6 +233,12 @@ int main(int argc, char **argv)
 				fprintf(stderr, "-Q: %u to %u\n", OZZY_PCM_QUEUE_MIN + 1, OZZY_NUM_PCM_IN_QUEUES);
 				return 2;
 			}
+		} else if (!strcmp(argv[i], "-O") && i + 1 < argc) {
+			out_queue = (unsigned int)atoi(argv[++i]);
+			if (out_queue < OZZY_PCM_QUEUE_MIN + 1 || out_queue > OZZY_NUM_PCM_OUT_QUEUES) {
+				fprintf(stderr, "-O: %u to %u\n", OZZY_PCM_QUEUE_MIN + 1, OZZY_NUM_PCM_OUT_QUEUES);
+				return 2;
+			}
 		}
 		else if (!strcmp(argv[i], "-d") && i + 1 < argc)
 			index = atoi(argv[++i]);
@@ -242,7 +252,7 @@ int main(int argc, char **argv)
 			if (sscanf(argv[++i], "%u-%u", &ch_first, &ch_last) == 1)
 				ch_last = ch_first;
 		} else {
-			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-A] [-X ms] [-F frames] [-Q in_flight] [-P off|period:compute]\n");
+			fprintf(stderr, "usage: ozzy-harness [-l] [-d N] [-R rate] [-s seconds] [-r capture.wav] [-c first[-last]] [-q] [-W] [-A] [-X ms] [-F frames] [-Q in_flight] [-O out_flight] [-P off|period:compute]\n");
 			return 2;
 		}
 	}
@@ -309,6 +319,8 @@ int main(int argc, char **argv)
 	}
 	if (in_queue)
 		ozzy_engine_set_setting(engine, OZZY_SETTING_PCM_IN_QUEUE, (uint8_t)(in_queue - 1));
+	if (out_queue)
+		ozzy_engine_set_setting(engine, OZZY_SETTING_PCM_OUT_QUEUE, (uint8_t)(out_queue - 1));
 	if (!ozzy_engine_start(engine)) {
 		fprintf(stderr, "engine start failed\n");
 		ozzy_engine_stop(engine);
@@ -327,6 +339,8 @@ int main(int argc, char **argv)
 			rate ? 1000.0 * q_out * f_out / rate : 0.0, q_in, f_in, rate ? 1000.0 * q_in * f_in / rate : 0.0);
 		if (in_queue && q_in != in_queue)
 			fprintf(stderr, "note: asked for %u in flight\n", in_queue);
+		if (out_queue && q_out != out_queue)
+			fprintf(stderr, "note: asked for %u out in flight\n", out_queue);
 	}
 	if (want_rate && want_rate != rate)
 		fprintf(stderr, "note: asked for %u Hz\n", want_rate);
@@ -383,7 +397,14 @@ int main(int argc, char **argv)
 				(long)wall.tv_sec, wall.tv_nsec / 1000000, t_now - seen_at[1] >= 500 ? "in" : "out",
 				(unsigned long long)(t_now - (seen_at[1] < seen_at[0] ? seen_at[1] : seen_at[0])));
 			uint64_t t0 = now_ms();
+			/* Device or host: reads the device stopped answering are still in flight, and the
+			 * reset has to abort them; a completion the host lost would never come back at all
+			 * (the abort then reports transfers still pending) */
+			int fly_out = atomic_load(&bus.pcm_in_flight[0]), fly_in = atomic_load(&bus.pcm_in_flight[1]);
+			unsigned int ab_out = atomic_load(&bus.pcm_aborted[0]), ab_in = atomic_load(&bus.pcm_aborted[1]);
 			ozzy_engine_suspend(engine);
+			fprintf(stderr, "  in flight at the wedge: out %d, in %d; aborted by the reset: out %u, in %u\n", fly_out,
+				fly_in, atomic_load(&bus.pcm_aborted[0]) - ab_out, atomic_load(&bus.pcm_aborted[1]) - ab_in);
 			bool ok = ibus_reselect(&bus) && ozzy_engine_start(engine);
 			/* streaming again only once both directions complete */
 			uint64_t base[2] = { atomic_load(&bus.total_done[0]), atomic_load(&bus.total_done[1]) };

@@ -114,24 +114,32 @@ enum ozzy_spdif_out_mode {
 #define OZZY_NUM_PCM_QUEUES 4
 
 /*
- * In, more can be offered than out, since it is margin and not latency. A build may raise it (the
- * macOS harness: 8, measuring whether margin is what a userspace host is short of at 96 kHz); a
- * platform with buffers of its own runs no more in flight than it has places (ploytec_start).
+ * A build may offer deeper queues, in and out separately (the macOS harness: 8 each, measuring
+ * what a userspace host needs at 96 kHz). In, they are margin against the device overflowing,
+ * with no latency; out, against it running dry, as latency. On the WZ4 a run dry is also what
+ * stops its IN side (the wedge): an IN overflow only loses input. The default stays
+ * OZZY_NUM_PCM_QUEUES either way; a platform with buffers of its own runs no more in flight than
+ * it has places (ploytec_start).
  */
 #ifndef OZZY_NUM_PCM_IN_QUEUES
 #define OZZY_NUM_PCM_IN_QUEUES OZZY_NUM_PCM_QUEUES
 #endif
+#ifndef OZZY_NUM_PCM_OUT_QUEUES
+#define OZZY_NUM_PCM_OUT_QUEUES OZZY_NUM_PCM_QUEUES
+#endif
 #define OZZY_MAX_PCM_QUEUES 8          /* the names below */
 
-typedef char ozzy_pcm_in_queues_fit[(OZZY_NUM_PCM_IN_QUEUES >= OZZY_NUM_PCM_QUEUES &&
-				     OZZY_NUM_PCM_IN_QUEUES <= OZZY_MAX_PCM_QUEUES) ? 1 : -1];
+typedef char ozzy_pcm_queues_fit[(OZZY_NUM_PCM_IN_QUEUES >= OZZY_NUM_PCM_QUEUES &&
+				  OZZY_NUM_PCM_IN_QUEUES <= OZZY_MAX_PCM_QUEUES &&
+				  OZZY_NUM_PCM_OUT_QUEUES >= OZZY_NUM_PCM_QUEUES &&
+				  OZZY_NUM_PCM_OUT_QUEUES <= OZZY_MAX_PCM_QUEUES) ? 1 : -1];
 
 #define OZZY_PCM_QUEUE_MIN 1           /* the lowest value offered: two in flight */
 
 /* The transfers in flight for value @value of the out (@in false) or in queue setting */
 static inline uint32_t ozzy_pcm_queue_dir(bool in, unsigned int value)
 {
-	unsigned int n = in ? OZZY_NUM_PCM_IN_QUEUES : OZZY_NUM_PCM_QUEUES;
+	unsigned int n = in ? OZZY_NUM_PCM_IN_QUEUES : OZZY_NUM_PCM_OUT_QUEUES;
 
 	if (value < OZZY_PCM_QUEUE_MIN)
 		value = OZZY_PCM_QUEUE_MIN;
@@ -277,7 +285,7 @@ static const struct ozzy_setting_desc ozzy_setting_descs[OZZY_NUM_SETTINGS] = {
 	  OZZY_QUIRK_PCM_OUT_FRAMES, OZZY_SETTING_DEVICE, 0 },
 	{ "PCM Capture Transfer", ozzy_pcm_in_frames_names, OZZY_NUM_PCM_IN_FRAMES, 9,
 	  OZZY_QUIRK_PCM_IN_FRAMES, OZZY_SETTING_DEVICE, 0 },
-	{ "PCM Playback Queue", ozzy_pcm_queue_names, OZZY_NUM_PCM_QUEUES, OZZY_NUM_PCM_QUEUES - 1,
+	{ "PCM Playback Queue", ozzy_pcm_queue_names, OZZY_NUM_PCM_OUT_QUEUES, OZZY_NUM_PCM_QUEUES - 1,
 	  OZZY_QUIRK_PCM_OUT_QUEUE, OZZY_SETTING_DEVICE, 0 },
 	{ "PCM Capture Queue", ozzy_pcm_queue_names, OZZY_NUM_PCM_IN_QUEUES, OZZY_NUM_PCM_QUEUES - 1,
 	  OZZY_QUIRK_PCM_IN_QUEUE, OZZY_SETTING_DEVICE, 0 },

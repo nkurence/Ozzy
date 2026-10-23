@@ -53,6 +53,8 @@ struct iousb_bus {
 	uint64_t last_done[2];                 /* mach time of the last completion, [0] out, [1] in */
 	atomic_uint_fast64_t total_done[2];    /* PCM completions since open, never reset (the watchdog) */
 	atomic_uint_fast64_t max_gap[2];       /* longest gap since the last ibus_take_stats, mach ticks */
+	atomic_int pcm_in_flight[2];           /* PCM transfers submitted and not yet completed, out / in */
+	atomic_uint pcm_aborted[2];            /* PCM transfers completed as aborted since open, out / in */
 	atomic_uint stall_ms;                  /* test: the next completion sleeps this long first, once */
 	uint32_t rt_period_us, rt_compute_us;  /* the completion thread's time-constraint policy, 0: none
 						  (set before ibus_open; both 0 from a zeroed struct means

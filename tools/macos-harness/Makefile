@@ -8,8 +8,9 @@ OZZY    := ../..
 CC      ?= cc
 CFLAGS  ?= -std=gnu11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 CPPFLAGS += -DOZZY_USER_ENGINE -I$(OZZY)
-# PCM IN transfers in flight up to 8 (-Q): margin for a userspace host (common/ozzy_settings.h)
-CPPFLAGS += -DOZZY_NUM_PCM_IN_QUEUES=8
+# PCM transfers in flight up to 8 each way (-Q in, -O out), for measuring what a userspace host
+# needs (common/ozzy_settings.h); the defaults stay 4
+CPPFLAGS += -DOZZY_NUM_PCM_IN_QUEUES=8 -DOZZY_NUM_PCM_OUT_QUEUES=8
 GIT_VERSION := $(shell git -C $(OZZY) describe --always --dirty 2>/dev/null)
 ifneq ($(GIT_VERSION),)
 CPPFLAGS += -DOZZY_GIT_VERSION='"$(GIT_VERSION)"'
